@@ -280,6 +280,7 @@ export default function App() {
   const [analyzingErrors, setAnalyzingErrors] = useState(false);
   const [analysisError, setAnalysisError] = useState(null);
   const [analysisModalOpen, setAnalysisModalOpen] = useState(false);
+  const [errorSampleSize, setErrorSampleSize] = useState(15);
   const configCounts = useMemo(() => {
     const m = {};
     for (const c of blobConfigs) m[c.config_id] = c.count;
@@ -460,7 +461,8 @@ export default function App() {
     setAnalyzingErrors(true);
     setAnalysisError(null);
     try {
-      const result = await apiPost(`/runs/${activeRunData.run_id}/analyze-errors`, {});
+      const payload = errorSampleSize === 0 ? { sample_size: 0 } : { sample_size: Number(errorSampleSize) };
+      const result = await apiPost(`/runs/${activeRunData.run_id}/analyze-errors`, payload);
       setActiveRunData(prev => ({
         ...prev,
         error_analysis: result
@@ -894,7 +896,23 @@ export default function App() {
                       <h3 className="font-bold text-slate-900 text-base">Business summary</h3>
                       <p className="text-xs text-slate-500">Saved to runs/{activeRunData.run_id}/benchmark_summary.md</p>
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap justify-end">
+                      <div className="flex items-center gap-1.5 text-xs text-slate-600 bg-slate-50 border border-slate-200 px-2.5 py-1.5 rounded-lg">
+                        <span className="font-medium text-slate-500">Sample:</span>
+                        <select
+                          value={errorSampleSize}
+                          onChange={e => setErrorSampleSize(Number(e.target.value))}
+                          disabled={analyzingErrors}
+                          className="bg-transparent font-semibold text-slate-800 outline-none cursor-pointer"
+                          title="Select how many articles with issues to audit with Gemini 3.8"
+                        >
+                          <option value={15}>15 issues</option>
+                          <option value={30}>30 issues</option>
+                          <option value={50}>50 issues</option>
+                          <option value={100}>100 issues</option>
+                          <option value={0}>All issues</option>
+                        </select>
+                      </div>
                       <button
                         onClick={runErrorAnalysis}
                         disabled={analyzingErrors}
@@ -958,8 +976,10 @@ export default function App() {
                       </div>
                       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 my-2 text-xs">
                         <div className="bg-white/80 p-2 rounded border border-indigo-100">
-                          <span className="text-slate-500 block">Total Issues</span>
-                          <span className="font-bold text-slate-900 text-sm">{activeRunData.error_analysis.total_issues}</span>
+                          <span className="text-slate-500 block">Audited Sample</span>
+                          <span className="font-bold text-slate-900 text-sm">
+                            {activeRunData.error_analysis.sample_analyzed_count} <span className="text-xs font-normal text-slate-500">of {activeRunData.error_analysis.total_issues} issues</span>
+                          </span>
                         </div>
                         <div className="bg-white/80 p-2 rounded border border-indigo-100">
                           <span className="text-emerald-700 block font-medium">Jev Preferred</span>
@@ -1315,9 +1335,9 @@ export default function App() {
           <div className="space-y-6">
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
               <StatCard
-                label="Total Issues"
-                value={activeRunData.error_analysis.total_issues}
-                sub={`${activeRunData.error_analysis.disagreements_count} disagreements, ${activeRunData.error_analysis.execution_failures_count} failures`}
+                label="Audited Sample"
+                value={activeRunData.error_analysis.sample_analyzed_count ?? activeRunData.error_analysis.total_issues}
+                sub={`of ${activeRunData.error_analysis.total_issues} total issues (${activeRunData.error_analysis.disagreements_count} disagreements)`}
                 icon={<AlertTriangle className="w-4 h-4 text-amber-500" />}
                 tone="amber"
               />

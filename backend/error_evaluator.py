@@ -170,8 +170,11 @@ Return ONLY a valid JSON object matching this schema:
         run_id: str,
         records: List[Dict[str, Any]],
         get_article_text_fn=None,
+        sample_size: Optional[int] = 15,
     ) -> Dict[str, Any]:
-        """Perform a complete error evaluation run across all issues in a benchmark run."""
+        """Perform an error evaluation run across issues in a benchmark run.
+        If sample_size is None or 0, evaluates all disagreements.
+        """
         started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ")
         issues = self.find_discrepancies(records)
 
@@ -193,8 +196,11 @@ Return ONLY a valid JSON object matching this schema:
         disagreements = [i for i in issues if i["type"] == "disagreement"]
         failures = [i for i in issues if i["type"] == "execution_failure"]
 
-        # Evaluate up to 15 representative disagreements in parallel with a concurrency semaphore
-        eval_sample = disagreements[:15]
+        # Evaluate selected sample size or all disagreements
+        if sample_size and sample_size > 0:
+            eval_sample = disagreements[:sample_size]
+        else:
+            eval_sample = disagreements
         sem = asyncio.Semaphore(5)
 
         async def arbitrate_single(issue):
