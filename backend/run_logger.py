@@ -285,6 +285,10 @@ Comparison of TypeSafe Jev decisions against baseline LLM audit labels:
         if os.path.exists(md_file):
             with open(md_file, "r") as f:
                 data["markdown_report"] = f.read()
+        analysis_file = os.path.join(r_dir, "error_analysis.json")
+        if os.path.exists(analysis_file):
+            with open(analysis_file, "r") as f:
+                data["error_analysis"] = json.load(f)
 
         records = []
         if os.path.exists(records_dir):
@@ -295,6 +299,13 @@ Comparison of TypeSafe Jev decisions against baseline LLM audit labels:
         data["records"] = records
         return data
 
+    def save_error_analysis(self, run_id: str, analysis: Dict[str, Any]) -> str:
+        r_dir = os.path.join(self.runs_dir, run_id)
+        os.makedirs(r_dir, exist_ok=True)
+        path = os.path.join(r_dir, "error_analysis.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(analysis, f, indent=2)
+        return path
 
     @staticmethod
     def _rmtree_safe(path: str) -> bool:

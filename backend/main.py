@@ -17,7 +17,7 @@ from question_converter import build_article_state, convert_config_to_jev_questi
 from typesafe_runner import typesafe_runner
 from comparator import compare_article_results
 from run_logger import run_logger
-
+from error_evaluator import error_evaluator, ErrorEvaluatorError
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("test_rig_api")
 
@@ -492,6 +492,52 @@ def get_run_details(run_id: str):
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
+
+@app.post("/api/runs/{run_id}/analyze-errors")
+async def analyze_run_errors(run_id: str):
+    run = run_logger.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if not settings.GEMINI_API_KEY:
+        raise HTTPException(status_code=400, detail="GEMINI_API_KEY is not configured in the environment")
+
+    def get_article_text(record: Dict[str, Any]) -> str:
+        blob_name = record.get("blob_name")
+        if blob_name:
+            try:
+                blob = blob_manager.get_blob(blob_name)
+                state_text, _ = build_article_state(blob)
+                return state_text
+            except Exception:
+                pass
+        return record.get("jev_request", {}).get("state") or record.get("headline", "")
+
+    try:
+        analysis = await error_evaluator.run_error_analysis(
+            run_id=run_id,
+            records=run.get("records", []),
+            get_article_text_fn=get_article_text,
+        )
+        run_logger.save_error_analysis(run_id, analysis)
+        return analysis
+    except ErrorEvaluatorError as e:
+        logger.error(f"Error analysis failed for {run_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.exception(f"Unexpected error analyzing {run_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/runs/{run_id}/error-analysis")
+def get_error_analysis(run_id: str):
+    run = run_logger.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    analysis = run.get("error_analysis")
+    if not analysis:
+        raise HTTPException(status_code=404, detail="No error analysis found for this run")
+    return analysis
 
 
 @app.delete("/api/runs/{run_id}")

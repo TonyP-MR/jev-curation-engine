@@ -19,7 +19,9 @@ import {
   Trash2,
   X,
   GitCompare,
-  Search
+  Search,
+  Brain,
+  AlertTriangle
 } from 'lucide-react';
 
 const API = '/api';
@@ -63,8 +65,70 @@ function splitMarkdownTableRow(line) {
   return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim());
 }
 
+function formatSummaryToMarkdown(value) {
+  if (!value) return '';
+  let data = value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        data = JSON.parse(trimmed);
+      } catch {
+        return value;
+      }
+    } else {
+      return value;
+    }
+  }
+
+  if (typeof data !== 'object' || data === null) return String(data);
+
+  const lines = [];
+  if (data.executive_verdict) {
+    const ev = data.executive_verdict;
+    lines.push('### Executive Verdict');
+    if (typeof ev === 'object' && ev !== null) {
+      if (ev.preferred_model) lines.push(`- **Preferred Model:** ${ev.preferred_model}`);
+      if (ev.win_rate_decisive) lines.push(`- **Decisive Win Rate:** ${ev.win_rate_decisive}`);
+      if (ev.summary) lines.push(`\n${ev.summary}\n`);
+    } else {
+      lines.push(`${ev}\n`);
+    }
+  }
+
+  if (Array.isArray(data.root_causes_of_discrepancies)) {
+    lines.push('### Root Causes of Discrepancies');
+    data.root_causes_of_discrepancies.forEach(item => {
+      if (typeof item === 'object' && item !== null) {
+        const pat = item.pattern || 'Pattern';
+        const desc = item.detail || item.description || '';
+        lines.push(`- **${pat}:** ${desc}`);
+      } else {
+        lines.push(`- ${item}`);
+      }
+    });
+    lines.push('');
+  }
+
+  if (Array.isArray(data.recommendations)) {
+    lines.push('### Recommendations');
+    data.recommendations.forEach(rec => {
+      if (typeof rec === 'object' && rec !== null) {
+        const act = rec.action || 'Action';
+        const det = rec.details || '';
+        lines.push(`- **${act}:** ${det}`);
+      } else {
+        lines.push(`- ${rec}`);
+      }
+    });
+  }
+
+  return lines.length > 0 ? lines.join('\n') : (typeof value === 'string' ? value : JSON.stringify(data, null, 2));
+}
+
 function MarkdownReport({ source }) {
-  const lines = String(source || '').split(/\r?\n/);
+  const cleanSource = formatSummaryToMarkdown(source);
+  const lines = String(cleanSource || '').split(/\r?\n/);
   const blocks = [];
   let index = 0;
 
@@ -213,7 +277,9 @@ export default function App() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewTab, setPreviewTab] = useState('request');
   const [detail, setDetail] = useState(null);
-
+  const [analyzingErrors, setAnalyzingErrors] = useState(false);
+  const [analysisError, setAnalysisError] = useState(null);
+  const [analysisModalOpen, setAnalysisModalOpen] = useState(false);
   const configCounts = useMemo(() => {
     const m = {};
     for (const c of blobConfigs) m[c.config_id] = c.count;
@@ -386,6 +452,25 @@ export default function App() {
       setActiveTab('benchmark');
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const runErrorAnalysis = async () => {
+    if (!activeRunData?.run_id) return;
+    setAnalyzingErrors(true);
+    setAnalysisError(null);
+    try {
+      const result = await apiPost(`/runs/${activeRunData.run_id}/analyze-errors`, {});
+      setActiveRunData(prev => ({
+        ...prev,
+        error_analysis: result
+      }));
+      setAnalysisModalOpen(true);
+    } catch (e) {
+      console.error('Error analysis failed', e);
+      setAnalysisError(e.message || String(e));
+    } finally {
+      setAnalyzingErrors(false);
     }
   };
   const deleteRun = async runId => {
@@ -809,13 +894,28 @@ export default function App() {
                       <h3 className="font-bold text-slate-900 text-base">Business summary</h3>
                       <p className="text-xs text-slate-500">Saved to runs/{activeRunData.run_id}/benchmark_summary.md</p>
                     </div>
-                    <button
-                      onClick={copyMarkdown}
-                      className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold flex items-center gap-1.5"
-                    >
-                      {copiedMd ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
-                      {copiedMd ? 'Copied' : 'Copy Markdown'}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={runErrorAnalysis}
+                        disabled={analyzingErrors}
+                        className="px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+                        title="Evaluate discrepancies with Gemini 3.8 to determine which model is correct and why"
+                      >
+                        {analyzingErrors ? (
+                          <RotateCw className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Brain className="w-3.5 h-3.5" />
+                        )}
+                        {analyzingErrors ? 'Analyzing Errors...' : 'Analyse Errors'}
+                      </button>
+                      <button
+                        onClick={copyMarkdown}
+                        className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold flex items-center gap-1.5"
+                      >
+                        {copiedMd ? <Check className="w-3.5 h-3.5 text-emerald-600" /> : <Copy className="w-3.5 h-3.5" />}
+                        {copiedMd ? 'Copied' : 'Copy Markdown'}
+                      </button>
+                    </div>
                   </div>
                   {summary.performance.total_llm_classification_cost_usd == null && (
                     <div className="mt-3 px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800">
@@ -830,6 +930,53 @@ export default function App() {
                   {summary.prompt_optimization?.enabled && (
                     <div className="mt-2 px-3 py-2 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600">
                       Question payload: {summary.prompt_optimization.original_question_chars.toLocaleString()} → {summary.prompt_optimization.optimized_question_chars.toLocaleString()} characters ({summary.prompt_optimization.estimated_char_reduction_pct ?? 0}% estimated reduction) across {summary.prompt_optimization.configs_compiled} config(s).
+                    </div>
+                  )}
+                  {analysisError && (
+                    <div className="mt-3 px-3 py-2 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800 flex items-center justify-between">
+                      <span>Error analysis failed: {analysisError}</span>
+                      <button onClick={() => setAnalysisError(null)} className="text-rose-600 hover:text-rose-800">
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+                  {activeRunData?.error_analysis && (
+                    <div className="mt-3 p-4 rounded-xl bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200 shadow-xs">
+                      <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-2">
+                          <Brain className="w-4 h-4 text-indigo-600" />
+                          <span className="font-bold text-xs text-indigo-950 uppercase tracking-wider">
+                            Gemini 3.8 Discrepancy Arbitration
+                          </span>
+                        </div>
+                        <button
+                          onClick={() => setAnalysisModalOpen(true)}
+                          className="text-xs font-semibold text-indigo-700 hover:text-indigo-900 underline flex items-center gap-1"
+                        >
+                          View detailed article verdicts ({activeRunData.error_analysis.sample_analyzed_count || 0})
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 my-2 text-xs">
+                        <div className="bg-white/80 p-2 rounded border border-indigo-100">
+                          <span className="text-slate-500 block">Total Issues</span>
+                          <span className="font-bold text-slate-900 text-sm">{activeRunData.error_analysis.total_issues}</span>
+                        </div>
+                        <div className="bg-white/80 p-2 rounded border border-indigo-100">
+                          <span className="text-emerald-700 block font-medium">Jev Preferred</span>
+                          <span className="font-bold text-emerald-800 text-sm">{activeRunData.error_analysis.jev_preferred_count}</span>
+                        </div>
+                        <div className="bg-white/80 p-2 rounded border border-indigo-100">
+                          <span className="text-blue-700 block font-medium">LLM Preferred</span>
+                          <span className="font-bold text-blue-800 text-sm">{activeRunData.error_analysis.llm_preferred_count}</span>
+                        </div>
+                        <div className="bg-white/80 p-2 rounded border border-indigo-100">
+                          <span className="text-amber-700 block font-medium">Ties / Defensible</span>
+                          <span className="font-bold text-amber-800 text-sm">{activeRunData.error_analysis.ties_count}</span>
+                        </div>
+                      </div>
+                      <div className="mt-2 text-xs text-indigo-900 bg-white/70 p-3 rounded border border-indigo-100 max-h-40 overflow-y-auto whitespace-pre-wrap leading-relaxed">
+                        <MarkdownReport source={activeRunData.error_analysis.executive_summary} />
+                      </div>
                     </div>
                   )}
                   <div className="mt-4 p-5 bg-white border border-slate-200 rounded-lg max-h-[34rem] overflow-auto">
@@ -1154,6 +1301,124 @@ export default function App() {
                 <JsonBlock value={detail.jev_request ?? 'not archived'} maxHeight="max-h-72" />
               </div>
             </details>
+          </div>
+        </Modal>
+      )}
+      {/* Error Analysis Detail Modal */}
+      {analysisModalOpen && activeRunData?.error_analysis && (
+        <Modal
+          wide
+          title="Gemini 3.8 Error & Discrepancy Arbitration Report"
+          subtitle={`Evaluated ${activeRunData.error_analysis.sample_analyzed_count || 0} articles with disagreements · Model: ${activeRunData.error_analysis.model}`}
+          onClose={() => setAnalysisModalOpen(false)}
+        >
+          <div className="space-y-6">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <StatCard
+                label="Total Issues"
+                value={activeRunData.error_analysis.total_issues}
+                sub={`${activeRunData.error_analysis.disagreements_count} disagreements, ${activeRunData.error_analysis.execution_failures_count} failures`}
+                icon={<AlertTriangle className="w-4 h-4 text-amber-500" />}
+                tone="amber"
+              />
+              <StatCard
+                label="Jev Preferred"
+                value={activeRunData.error_analysis.jev_preferred_count}
+                sub="Better calibrated / grounded"
+                icon={<CheckCircle2 className="w-4 h-4 text-emerald-500" />}
+                tone="emerald"
+              />
+              <StatCard
+                label="LLM Preferred"
+                value={activeRunData.error_analysis.llm_preferred_count}
+                sub="Better baseline judgment"
+                icon={<CheckCircle2 className="w-4 h-4 text-blue-500" />}
+                tone="blue"
+              />
+              <StatCard
+                label="Ties / Defensible"
+                value={activeRunData.error_analysis.ties_count}
+                sub="Ambiguous context"
+                icon={<GitCompare className="w-4 h-4 text-slate-500" />}
+                tone="slate"
+              />
+            </div>
+
+            <div className="bg-slate-50 border border-slate-200 rounded-xl p-5">
+              <h4 className="font-bold text-slate-900 text-sm mb-2 flex items-center gap-1.5">
+                <Brain className="w-4 h-4 text-indigo-600" />
+                Executive Synthesis
+              </h4>
+              <div className="text-xs text-slate-700 leading-relaxed max-h-60 overflow-y-auto bg-white p-4 rounded-lg border border-slate-200">
+                <MarkdownReport source={activeRunData.error_analysis.executive_summary} />
+              </div>
+            </div>
+
+            <div>
+              <h4 className="font-bold text-slate-900 text-sm mb-3">
+                Detailed Article Verdicts ({activeRunData.error_analysis.article_evaluations?.length || 0})
+              </h4>
+              <div className="space-y-4 max-h-[32rem] overflow-y-auto pr-1">
+                {activeRunData.error_analysis.article_evaluations?.map((ev, i) => {
+                  const arb = ev.arbitration || {};
+                  const pref = arb.overall_preferred_model;
+                  return (
+                    <div key={i} className="bg-white border border-slate-200 rounded-xl p-4 shadow-2xs hover:border-slate-300">
+                      <div className="flex items-start justify-between gap-3 mb-2">
+                        <div>
+                          <h5 className="font-semibold text-slate-900 text-sm">{ev.headline}</h5>
+                          <p className="font-mono text-xs text-slate-500">{ev.correlation_id} {ev.config_id ? `· ${ev.config_id}` : ''}</p>
+                        </div>
+                        <span className={`shrink-0 px-2.5 py-1 rounded-full text-xs font-bold uppercase tracking-wider ${
+                          pref === 'jev'
+                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                            : pref === 'llm'
+                            ? 'bg-blue-100 text-blue-800 border border-blue-200'
+                            : 'bg-slate-100 text-slate-700 border border-slate-200'
+                        }`}>
+                          {pref === 'jev' ? '✓ Jev Correct' : pref === 'llm' ? '✓ LLM Correct' : 'Tie / Defensible'}
+                        </span>
+                      </div>
+
+                      {arb.summary && (
+                        <p className="text-xs text-slate-600 italic bg-slate-50 p-2.5 rounded-lg mb-3 border border-slate-100">
+                          "{arb.summary}"
+                        </p>
+                      )}
+
+                      {arb.verdicts?.length > 0 && (
+                        <div className="space-y-2 mt-2">
+                          <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">Decision Breakdown</span>
+                          {arb.verdicts.map((v, idx) => (
+                            <div key={idx} className="bg-slate-50/70 p-2.5 rounded-lg border border-slate-200 text-xs">
+                              <div className="flex items-center justify-between mb-1">
+                                <span className="font-semibold text-slate-800">{v.item} · <span className="capitalize">{v.dimension}</span></span>
+                                <span className={`font-mono text-[11px] font-bold px-1.5 py-0.5 rounded ${
+                                  v.correct_model === 'jev'
+                                    ? 'bg-emerald-100 text-emerald-800'
+                                    : v.correct_model === 'llm'
+                                    ? 'bg-blue-100 text-blue-800'
+                                    : 'bg-amber-100 text-amber-800'
+                                }`}>
+                                  Winner: {v.correct_model}
+                                </span>
+                              </div>
+                              <div className="grid grid-cols-2 gap-2 text-[11px] my-1 font-mono text-slate-600">
+                                <div>LLM: <span className="font-semibold text-slate-800">{String(v.llm_value)}</span></div>
+                                <div>Jev: <span className="font-semibold text-slate-800">{String(v.jev_value)}</span></div>
+                              </div>
+                              <p className="text-slate-600 text-[11px] mt-1 pt-1 border-t border-slate-200/60 leading-normal">
+                                {v.reasoning}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           </div>
         </Modal>
       )}
