@@ -19,7 +19,7 @@ from run_logger import run_logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("test_rig_api")
 
-app = FastAPI(title="TypeSafe Jev Test Rig API", version="1.0.0")
+app = FastAPI(title="jev-curation-engine API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,

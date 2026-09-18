@@ -419,7 +419,7 @@ export default function App() {
             </div>
             <div>
               <h1 className="text-lg font-bold tracking-tight flex items-center gap-2">
-                TypeSafe Jev
+                jev-curation-engine
                 <span className="text-xs bg-[#0b82f4]/30 text-[#60a5fa] px-2 py-0.5 rounded border border-[#0b82f4]/40 font-mono">
                   Test Rig
                 </span>
@@ -499,27 +499,29 @@ export default function App() {
                 />
               </div>
 
-              <div className="text-sm text-slate-600 ml-auto">
-                <span className="font-semibold text-slate-900">{selectedBlobs.length}</span> of{' '}
-                <span className="font-semibold">{filteredBlobs.length}</span> selected
+              <div className="ml-auto w-full lg:w-auto flex flex-wrap items-center justify-end gap-2">
+                <span className="text-sm text-slate-600 whitespace-nowrap">
+                  <span className="font-semibold text-slate-900">{selectedBlobs.length}</span> of{' '}
+                  <span className="font-semibold">{filteredBlobs.length}</span> selected
+                </span>
                 <button
                   onClick={() => fetchBlobs(selectedConfig, true)}
                   title="Refresh the processed article list from pipeline_audit_log"
-                  className="px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 text-sm font-medium flex items-center gap-1.5 shadow-sm"
+                  className="px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 text-sm font-medium inline-flex items-center gap-1.5 shadow-sm"
                 >
                   <RotateCw className={`w-4 h-4 ${loadingBlobs ? 'animate-spin' : ''}`} /> Refresh
                 </button>
                 <button
                   onClick={selectAllBlobs}
                   disabled={filteredBlobs.length === 0}
-                  className="px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 text-sm font-medium shadow-sm disabled:opacity-50"
+                  className="px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 text-sm font-medium inline-flex items-center shadow-sm disabled:opacity-50"
                 >
                   {allFilteredSelected ? 'Deselect All' : 'Select All'}
                 </button>
                 <button
                   onClick={runBenchmark}
                   disabled={selectedBlobs.length === 0}
-                  className="px-5 py-2 rounded-lg bg-[#0b82f4] hover:bg-[#096fd1] text-white text-sm font-semibold flex items-center gap-2 shadow-sm disabled:opacity-50"
+                  className="px-5 py-2 rounded-lg bg-[#0b82f4] hover:bg-[#096fd1] text-white text-sm font-semibold inline-flex items-center gap-2 shadow-sm disabled:opacity-50"
                 >
                   <Play className="w-4 h-4 fill-white" /> Run Jev Benchmark
                 </button>

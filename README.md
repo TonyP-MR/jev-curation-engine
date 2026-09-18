@@ -1,4 +1,4 @@
-# TypeSafe Curation Engine prototype
+# jev-curation-engine
 
 A small, read-only feasibility test rig for comparing TypeSafe Jev with the Curation Engine's existing LLM classification results.
 
