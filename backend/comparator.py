@@ -255,6 +255,7 @@ def compare_article_results(
 
     jev_duration_ms = jev_result.get("duration_ms", 0.0)
     jev_cost_usd = jev_result.get("cost_usd", 0.0)
+    speedup_ratio = round(llm_duration_ms / max(jev_duration_ms, 1.0), 2) if llm_duration_ms > 0 else 1.0
     classification_cost_usd = classification_cost_info["cost_usd"]
     classification_cost_multiple = round(classification_cost_usd / max(jev_cost_usd, 0.00000001), 1) if jev_cost_usd > 0 else None
     classification_savings_pct = round(
