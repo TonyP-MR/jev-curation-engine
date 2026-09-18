@@ -104,15 +104,37 @@ records/<correlation_id>.json
 
 Records include the configuration version, baseline LLM output, Jev request payload, Jev response, token usage, latency, cost provenance, and per-decision comparisons.
 
-The dashboard also supports:
-
-- config-filtered article selection;
+- single-config article selection and multi-config batch execution;
+- automatic sequential 50-article batching across multiple configurations;
+- bounded parallel processing (`BENCHMARK_CONCURRENCY`) with transient error backoff;
+- OpenRouter provider routing with app attribution headers (`HTTP-Referer`, `X-Title`, `User-Agent`);
+- automated disagreement evaluation and error arbitration using Gemini 3.8 (`Analyse Errors`);
+- configurable error analysis sample sizes with executive synthesis reports;
 - exact TypeSafe payload inspection;
 - LLM versus Jev side-by-side output comparison;
 - cost and latency multiples;
 - per-run Markdown export;
 - deleting one run or clearing all local runs.
 
+## Multi-config batch mode and error analysis
+
+### Multi-config batch mode
+
+In the **Select Blobs** tab, switch the **Benchmark mode** toggle to **Batch configs**:
+
+1. Select one or more configurations using the searchable checklist.
+2. The backend automatically queries `pipeline_audit_log` for the latest 50 processed articles per selected configuration.
+3. Runs evaluate with bounded concurrency while preserving configuration grouping and sequential progress tracking.
+4. Upstream transient errors (`520`, `502`, rate limits) automatically retry with backoff, and articles exceeding context windows throttle state safely.
+
+### Discrepancy arbitration (`Analyse Errors`)
+
+From the **Dashboard** for any completed run:
+
+1. Click **Analyse Errors** in the Business summary header.
+2. Gemini 3.8 audits discrepancies across subject validation, prominence, sentiment, and LLM tags against source article text.
+3. The system generates an **Executive Synthesis** detailing winning models, pattern root causes (e.g. baseline hallucination vs Jev strict text grounding), and actionable tuning recommendations.
+4. Inspect individual article rulings and field-by-field verdicts in the detail modal.
 ## Important limitations
 
 This is a feasibility tool, not a production replacement service.
