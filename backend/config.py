@@ -15,6 +15,7 @@ _MANAGED_KEYS = [
     "TYPESAFE_API_KEY", "TYPESAFE_MODEL", "TYPESAFE_API_BASE",
     "JEV_PROVIDER", "OPENROUTER_API_KEY", "OPENROUTER_JEV_API_KEY",
     "OPENROUTER_BASE_URL", "OPENROUTER_JEV_MODEL", "OPENROUTER_APP_TITLE",
+    "OPENROUTER_USER_AGENT", "OPENROUTER_HTTP_REFERER",
     "GEMINI_API_KEY", "GEMINI_OPTIMIZER_MODEL", "PROMPT_OPTIMIZATION_ENABLED",
     "LLM_INPUT_COST_PER_MTOK", "LLM_OUTPUT_COST_PER_MTOK",
     "LLM_FLAT_COST_PER_ARTICLE_USD",
@@ -91,10 +92,14 @@ class Settings(BaseSettings):
     OPENROUTER_BASE_URL: str = "https://openrouter.ai"
     OPENROUTER_JEV_MODEL: str = "typesafe/jev-1.13"
     OPENROUTER_APP_TITLE: str = "jev-curation-engine"
+    OPENROUTER_USER_AGENT: str = "jev-curation-engine-benchmark/1.0"
+    OPENROUTER_HTTP_REFERER: str = "https://muckrack.com/curation-engine"
     GEMINI_API_KEY: str = ""
     GEMINI_OPTIMIZER_MODEL: str = "gemini-2.5-flash"
     PROMPT_OPTIMIZATION_ENABLED: bool = False
     TYPESAFE_COST_PER_MILLION_INPUT_TOKENS: float = 0.042
+    # Number of parallel requests sent during benchmark execution (default: 5)
+    BENCHMARK_CONCURRENCY: int = 5
 
     # --- Baseline LLM pricing (used when the blob has no recorded cost) ---
     # Audit blobs write llm_cost_usd = null, so the rig estimates from llm_tokens.

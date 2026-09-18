@@ -23,14 +23,20 @@ def build_article_state(blob_data: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]
 
     is_clip = str(media_type).lower() in ("radio", "television", "tv")
     item_kind = "clip (broadcast transcript)" if is_clip else "written article"
-
-    state_text = f"Item Type: {item_kind}\n"
+    # Jev limit: 32k tokens max for state (~120k characters).
+    # Truncate exceptionally long articles (e.g. 500k+ chars transcript/dump) so request stays in context.
+    MAX_STATE_CHARS = 120_000
+    full_state = f"Item Type: {item_kind}\n"
     if source:
-        state_text += f"Source: {source}\n"
+        full_state += f"Source: {source}\n"
     if published_at:
-        state_text += f"Published: {published_at}\n"
-    state_text += f"\nHeadline: {headline}\n\nBody:\n{body}"
+        full_state += f"Published: {published_at}\n"
+    full_state += f"\nHeadline: {headline}\n\nBody:\n{body}"
 
+    if len(full_state) > MAX_STATE_CHARS:
+        state_text = full_state[:MAX_STATE_CHARS] + "\n\n[... article body truncated due to context window limits ...]"
+    else:
+        state_text = full_state
     metadata = {
         "headline": headline,
         "media_type": media_type,

@@ -9,7 +9,13 @@ class RunLogger:
         self.runs_dir = settings.RUNS_DIR
         os.makedirs(self.runs_dir, exist_ok=True)
 
-    def create_run_session(self, run_id: str, config_id: str, article_count: int) -> str:
+    def create_run_session(
+        self,
+        run_id: str,
+        config_id: str,
+        article_count: int,
+        config_ids: Optional[List[str]] = None,
+    ) -> str:
         run_folder = os.path.join(self.runs_dir, run_id)
         records_folder = os.path.join(run_folder, "records")
         os.makedirs(records_folder, exist_ok=True)
@@ -18,6 +24,7 @@ class RunLogger:
             "run_id": run_id,
             "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "config_id": config_id,
+            "config_ids": config_ids or [config_id],
             "article_count": article_count,
             "status": "in_progress"
         }
@@ -26,9 +33,16 @@ class RunLogger:
 
         return run_folder
 
-    def log_article_result(self, run_id: str, correlation_id: str, comparison: Dict[str, Any]) -> None:
+    def log_article_result(
+        self,
+        run_id: str,
+        correlation_id: str,
+        comparison: Dict[str, Any],
+        record_key: Optional[str] = None,
+    ) -> None:
         records_folder = os.path.join(self.runs_dir, run_id, "records")
-        file_path = os.path.join(records_folder, f"{correlation_id}.json")
+        file_key = record_key or correlation_id
+        file_path = os.path.join(records_folder, f"{file_key}.json")
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(comparison, f, indent=2, default=str)
 

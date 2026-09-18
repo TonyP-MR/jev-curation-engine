@@ -1,3 +1,4 @@
+import asyncio
 import time
 import logging
 from typing import Any, Dict, Optional, Tuple
@@ -33,10 +34,12 @@ class TypeSafeRunner:
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
+                "HTTP-Referer": settings.OPENROUTER_HTTP_REFERER or "https://muckrack.com/curation-engine",
+                "X-Title": settings.OPENROUTER_APP_TITLE,
                 "X-OpenRouter-Title": settings.OPENROUTER_APP_TITLE,
+                "User-Agent": settings.OPENROUTER_USER_AGENT or settings.OPENROUTER_APP_TITLE,
             }
         else:
-            endpoint = f"{self.api_base.rstrip('/')}/systemone"
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -46,14 +49,43 @@ class TypeSafeRunner:
             "model": target_model,
             "questions": questions
         }
-
         start_time = time.perf_counter()
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(endpoint, json=payload, headers=headers)
-            if resp.is_error:
-                raise RuntimeError(f"Jev {self.provider} API {resp.status_code}: {resp.text[:1000]}")
-            data = resp.json()
-
+        data = None
+        max_retries = 3
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            for attempt in range(max_retries + 1):
+                try:
+                    resp = await client.post(endpoint, json=payload, headers=headers)
+                    if resp.status_code == 400 and "max_tokens_exceeded" in resp.text and attempt < max_retries:
+                        # The article state exceeded Jev's context window. Throttle / halve state size and retry.
+                        current_state = payload.get("state", "")
+                        new_len = len(current_state) // 2
+                        logger.warning(
+                            f"Jev {self.provider} max_tokens_exceeded on attempt {attempt + 1}. Throttling state from {len(current_state)} to {new_len} chars and retrying..."
+                        )
+                        payload["state"] = current_state[:new_len] + "\n\n[... truncated due to max_tokens_exceeded ...]"
+                        await asyncio.sleep(1.0)
+                        continue
+                    if resp.status_code in (500, 502, 503, 504, 520, 521, 522, 524, 429) and attempt < max_retries:
+                        wait_sec = (attempt + 1) * 2.0
+                        logger.warning(
+                            f"Jev {self.provider} API {resp.status_code} on attempt {attempt + 1}, retrying in {wait_sec}s..."
+                        )
+                        await asyncio.sleep(wait_sec)
+                        continue
+                    if resp.is_error:
+                        raise RuntimeError(f"Jev {self.provider} API {resp.status_code}: {resp.text[:1000]}")
+                    data = resp.json()
+                    break
+                except (httpx.TimeoutException, httpx.NetworkError) as net_err:
+                    if attempt < max_retries:
+                        wait_sec = (attempt + 1) * 2.0
+                        logger.warning(
+                            f"Jev {self.provider} network error on attempt {attempt + 1}: {net_err}, retrying in {wait_sec}s..."
+                        )
+                        await asyncio.sleep(wait_sec)
+                        continue
+                    raise
         duration_ms = (time.perf_counter() - start_time) * 1000.0
         usage = data.get("usage", {})
         input_tokens = usage.get("input_tokens", 0)

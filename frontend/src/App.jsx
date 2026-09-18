@@ -36,7 +36,9 @@ async function apiPost(path, body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
-  return res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `${path} -> ${res.status}`);
+  return data;
 }
 
 function formatJsonForDisplay(value) {
@@ -189,11 +191,14 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('picker');
   const [configs, setConfigs] = useState([]);
   const [blobConfigs, setBlobConfigs] = useState([]);
+  const [runMode, setRunMode] = useState('single');
   const [selectedConfig, setSelectedConfig] = useState('');
+  const [selectedConfigIds, setSelectedConfigIds] = useState([]);
   const [blobs, setBlobs] = useState([]);
   const [selectedBlobs, setSelectedBlobs] = useState([]);
   const [loadingBlobs, setLoadingBlobs] = useState(false);
   const [search, setSearch] = useState('');
+  const [configSearch, setConfigSearch] = useState('');
   const [runs, setRuns] = useState([]);
   const [llmCostOverride, setLlmCostOverride] = useState('');
   const [optimizePrompts, setOptimizePrompts] = useState(false);
@@ -214,21 +219,24 @@ export default function App() {
     for (const c of blobConfigs) m[c.config_id] = c.count;
     return m;
   }, [blobConfigs]);
-
   useEffect(() => {
     (async () => {
       try {
-        const [dbConfigs, runList, health] = await Promise.all([
+        const [dbConfigs, runList, health, cachedConfigCounts] = await Promise.all([
           apiGet('/configs'),
           apiGet('/runs'),
-          apiGet('/health')
+          apiGet('/health'),
+          apiGet('/blob-configs')
         ]);
         setConfigs(dbConfigs);
+        setBlobConfigs(cachedConfigCounts);
         setRuns(runList);
         if (health?.environment) setEnvironment(health.environment);
         setOptimizerAvailable(Boolean(health?.prompt_optimization_enabled && health?.prompt_optimization_key_configured));
         const latest = dbConfigs.find(c => c.config_id === health?.latest_audit_config);
-        setSelectedConfig(latest?.config_id || dbConfigs[0]?.config_id || '');
+        const initialConfig = latest?.config_id || dbConfigs[0]?.config_id || '';
+        setSelectedConfig(initialConfig);
+        if (initialConfig) setSelectedConfigIds([initialConfig]);
       } catch (e) {
         console.error('Initial load failed', e);
       }
@@ -278,6 +286,20 @@ export default function App() {
     );
   }, [blobs, search]);
 
+  const filteredConfigs = useMemo(() => {
+    if (!configSearch.trim()) return configs;
+    const q = configSearch.toLowerCase();
+    return configs.filter(c =>
+      `${c.config_name || ''} ${c.config_id || ''}`.toLowerCase().includes(q)
+    );
+  }, [configs, configSearch]);
+
+  const toggleConfig = configId => {
+    setSelectedConfigIds(prev =>
+      prev.includes(configId) ? prev.filter(id => id !== configId) : [...prev, configId]
+    );
+  };
+
   const toggleSelectBlob = name =>
     setSelectedBlobs(prev =>
       prev.includes(name) ? prev.filter(b => b !== name) : [...prev, name]
@@ -304,21 +326,34 @@ export default function App() {
   };
 
   const runBenchmark = async () => {
-    if (selectedBlobs.length === 0) return;
+    const isBatch = runMode === 'batch';
+    if (isBatch ? selectedConfigIds.length === 0 : selectedBlobs.length === 0) return;
     setActiveTab('benchmark');
-    setJobStatus({ status: 'starting', processed: 0, total: selectedBlobs.length });
+    setJobStatus({
+      status: 'starting',
+      mode: isBatch ? 'batch' : 'single',
+      processed: 0,
+      total: isBatch ? selectedConfigIds.length * 50 : selectedBlobs.length,
+    });
     setActiveRunData(null);
     try {
-      const payload = {
-        blob_names: selectedBlobs,
-        config_id: selectedConfig,
-        noul_threshold: 0.5,
-        optimize_prompts: optimizePrompts
-      };
+      const payload = isBatch
+        ? {
+            config_ids: selectedConfigIds,
+            noul_threshold: 0.5,
+            optimize_prompts: optimizePrompts,
+          }
+        : {
+            blob_names: selectedBlobs,
+            config_id: selectedConfig,
+            noul_threshold: 0.5,
+            optimize_prompts: optimizePrompts,
+          };
       const override = parseFloat(llmCostOverride);
       if (!Number.isNaN(override)) payload.llm_cost_override_usd = override;
-      const data = await apiPost('/benchmark/run', payload);
+      const data = await apiPost(isBatch ? '/benchmark/batch-run' : '/benchmark/run', payload);
       setJobId(data.job_id);
+      setJobStatus(prev => ({ ...prev, ...data }));
       pollJob(data.job_id);
     } catch (e) {
       setJobStatus({ status: 'failed', error: String(e) });
@@ -452,40 +487,98 @@ export default function App() {
         {activeTab === 'picker' && (
           <div className="space-y-6">
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5 flex flex-wrap items-end gap-4">
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">
-                  Curation Config
-                </label>
-                <select
-                  value={selectedConfig}
-                  onChange={e => setSelectedConfig(e.target.value)}
-                  className="bg-slate-50 border border-slate-300 text-slate-900 text-sm rounded-lg px-3 py-2 font-medium min-w-[16rem]"
-                >
-                  {configs.map(c => {
-                    const count = configCounts[c.config_id];
-                    return (
-                      <option key={c.config_id} value={c.config_id}>
-                        {c.config_name} (v{c.version_number}){count != null ? ` — ${count} articles` : ''}
-                      </option>
-                    );
-                  })}
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">
-                  Search
-                </label>
-                <div className="relative">
-                  <Search className="w-4 h-4 text-slate-400 absolute left-2.5 top-2.5" />
-                  <input
-                    value={search}
-                    onChange={e => setSearch(e.target.value)}
-                    placeholder="headline, correlation id…"
-                    className="pl-8 pr-3 py-2 border border-slate-300 rounded-lg text-sm w-64 bg-slate-50"
-                  />
+              <div className="w-full flex items-center justify-between border-b border-slate-200 pb-4">
+                <div>
+                  <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Benchmark mode</p>
+                  <p className="text-sm text-slate-600 mt-1">Run one selected sample or 50 recent articles per config.</p>
+                </div>
+                <div className="flex rounded-lg border border-slate-300 p-0.5 bg-slate-50">
+                  {[
+                    ['single', 'Single config'],
+                    ['batch', 'Batch configs'],
+                  ].map(([mode, label]) => (
+                    <button
+                      key={mode}
+                      onClick={() => {
+                        setRunMode(mode);
+                        if (mode === 'batch') setSelectedBlobs([]);
+                      }}
+                      className={`px-3 py-1.5 rounded-md text-sm font-medium ${runMode === mode ? 'bg-slate-800 text-white' : 'text-slate-600 hover:bg-white'}`}
+                    >
+                      {label}
+                    </button>
+                  ))}
                 </div>
               </div>
+
+              {runMode === 'single' ? (
+                <>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Curation Config</label>
+                    <select
+                      value={selectedConfig}
+                      onChange={e => setSelectedConfig(e.target.value)}
+                      className="bg-slate-50 border border-slate-300 text-slate-900 text-sm rounded-lg px-3 py-2 font-medium min-w-[16rem]"
+                    >
+                      {configs.map(c => {
+                        const count = configCounts[c.config_id];
+                        return (
+                          <option key={c.config_id} value={c.config_id}>
+                            {c.config_name} (v{c.version_number}){count != null ? ` — ${count} articles` : ''}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">Search</label>
+                    <div className="relative">
+                      <Search className="w-4 h-4 text-slate-400 absolute left-2.5 top-2.5" />
+                      <input
+                        value={search}
+                        onChange={e => setSearch(e.target.value)}
+                        placeholder="headline, correlation id…"
+                        className="pl-8 pr-3 py-2 border border-slate-300 rounded-lg text-sm w-64 bg-slate-50"
+                      />
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="w-full">
+                  <div className="flex items-center justify-between gap-3 mb-2">
+                    <label className="block text-xs font-semibold text-slate-500 uppercase tracking-wider">Configurations</label>
+                    <span className="text-xs text-slate-500">{selectedConfigIds.length} selected · up to 50 articles each</span>
+                  </div>
+                  <div className="relative mb-2 max-w-md">
+                    <Search className="w-4 h-4 text-slate-400 absolute left-2.5 top-2.5" />
+                    <input
+                      value={configSearch}
+                      onChange={e => setConfigSearch(e.target.value)}
+                      placeholder="Search configurations…"
+                      className="pl-8 pr-3 py-2 border border-slate-300 rounded-lg text-sm w-full bg-slate-50"
+                    />
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2 max-h-48 overflow-y-auto border border-slate-200 rounded-lg p-2">
+                    {filteredConfigs.map(config => {
+                      const isSelected = selectedConfigIds.includes(config.config_id);
+                      const count = configCounts[config.config_id];
+                      return (
+                        <label key={config.config_id} className={`flex items-center gap-2 rounded-lg px-3 py-2 cursor-pointer ${isSelected ? 'bg-blue-50 border border-blue-200' : 'hover:bg-slate-50 border border-transparent'}`}>
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleConfig(config.config_id)}
+                            className="h-4 w-4 rounded border-slate-300 text-[#0b82f4]"
+                          />
+                          <span className="min-w-0 text-sm text-slate-800 truncate">{config.config_name}</span>
+                          <span className="ml-auto shrink-0 text-xs text-slate-500">v{config.version_number}{count != null ? ` · ${count}` : ''}</span>
+                        </label>
+                      );
+                    })}
+                    {filteredConfigs.length === 0 && <span className="p-2 text-sm text-slate-500">No matching configurations.</span>}
+                  </div>
+                </div>
+              )}
 
               <div>
                 <label
@@ -513,35 +606,31 @@ export default function App() {
               </label>
 
               <div className="ml-auto w-full lg:w-auto flex flex-wrap items-center justify-end gap-2">
-                <span className="text-sm text-slate-600 whitespace-nowrap">
-                  <span className="font-semibold text-slate-900">{selectedBlobs.length}</span> of{' '}
-                  <span className="font-semibold">{filteredBlobs.length}</span> selected
-                </span>
-                <button
-                  onClick={() => fetchBlobs(selectedConfig, true)}
-                  title="Refresh the processed article list from pipeline_audit_log"
-                  className="px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 text-sm font-medium inline-flex items-center gap-1.5 shadow-sm"
-                >
-                  <RotateCw className={`w-4 h-4 ${loadingBlobs ? 'animate-spin' : ''}`} /> Refresh
-                </button>
-                <button
-                  onClick={selectAllBlobs}
-                  disabled={filteredBlobs.length === 0}
-                  className="px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 text-sm font-medium inline-flex items-center shadow-sm disabled:opacity-50"
-                >
-                  {allFilteredSelected ? 'Deselect All' : 'Select All'}
-                </button>
+                {runMode === 'single' ? (
+                  <>
+                    <span className="text-sm text-slate-600 whitespace-nowrap"><span className="font-semibold text-slate-900">{selectedBlobs.length}</span> of <span className="font-semibold">{filteredBlobs.length}</span> selected</span>
+                    <button onClick={() => fetchBlobs(selectedConfig, true)} title="Refresh the processed article list from pipeline_audit_log" className="px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 text-sm font-medium inline-flex items-center gap-1.5 shadow-sm">
+                      <RotateCw className={`w-4 h-4 ${loadingBlobs ? 'animate-spin' : ''}`} /> Refresh
+                    </button>
+                    <button onClick={selectAllBlobs} disabled={filteredBlobs.length === 0} className="px-3 py-2 rounded-lg border border-slate-300 text-slate-700 bg-white hover:bg-slate-50 text-sm font-medium inline-flex items-center shadow-sm disabled:opacity-50">
+                      {allFilteredSelected ? 'Deselect All' : 'Select All'}
+                    </button>
+                  </>
+                ) : (
+                  <span className="text-sm text-slate-600 whitespace-nowrap"><span className="font-semibold text-slate-900">{selectedConfigIds.length}</span> configs · 50 articles each</span>
+                )}
                 <button
                   onClick={runBenchmark}
-                  disabled={selectedBlobs.length === 0}
+                  disabled={runMode === 'batch' ? selectedConfigIds.length === 0 : selectedBlobs.length === 0}
                   className="px-5 py-2 rounded-lg bg-[#0b82f4] hover:bg-[#096fd1] text-white text-sm font-semibold inline-flex items-center gap-2 shadow-sm disabled:opacity-50"
                 >
-                  <Play className="w-4 h-4 fill-white" /> Run Jev Benchmark
+                  <Play className="w-4 h-4 fill-white" /> {runMode === 'batch' ? 'Run Batch Benchmark' : 'Run Jev Benchmark'}
                 </button>
               </div>
             </div>
 
-            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+            {runMode === 'single' ? (
+              <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
               <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between bg-slate-50/60">
                 <h3 className="font-semibold text-slate-900 text-sm flex items-center gap-2">
                   <FileText className="w-4 h-4 text-slate-500" />
@@ -601,6 +690,16 @@ export default function App() {
                 })}
               </div>
             </div>
+            ) : (
+              <div className="bg-white rounded-xl border border-blue-200 shadow-sm p-8 text-center">
+                <Layers className="w-10 h-10 text-blue-400 mx-auto mb-3" />
+                <h3 className="font-semibold text-slate-900">Batch mode ready</h3>
+                <p className="text-sm text-slate-600 mt-2 max-w-xl mx-auto">
+                  The backend will select up to 50 newest processed articles for each checked configuration and evaluate them one configuration at a time.
+                </p>
+                <p className="text-xs text-slate-500 mt-3">No article blobs need to be selected manually.</p>
+              </div>
+            )}
           </div>
         )}
 
@@ -613,12 +712,16 @@ export default function App() {
                     <RotateCw className="w-4 h-4 text-blue-600 animate-spin" />
                     {jobStatus.phase === 'optimizing_prompts'
                       ? `Optimizing prompts for ${jobStatus.optimizer_config || 'configuration'}…`
-                      : 'Evaluating with TypeSafe Jev…'}
+                      : jobStatus.mode === 'batch'
+                        ? `Evaluating ${jobStatus.current_config_id || 'configuration'} sequentially…`
+                        : 'Evaluating with TypeSafe Jev…'}
                   </h4>
                   <p className="text-xs text-slate-500 mt-1">
                     {jobStatus.phase === 'optimizing_prompts'
                       ? `Gemini ${jobStatus.optimizer_status || 'compiling'} rubric before article evaluation`
-                      : `${jobStatus.processed || 0} / ${jobStatus.total} articles`}
+                      : jobStatus.mode === 'batch'
+                        ? `Config ${jobStatus.config_index || 1} / ${jobStatus.config_total || 1} · article ${jobStatus.config_article_index || 0} / ${jobStatus.config_article_total || 0} · overall ${jobStatus.processed || 0} / ${jobStatus.total}`
+                        : `${jobStatus.processed || 0} / ${jobStatus.total} articles`}
                   </p>
                 </div>
                 <div className="w-48 bg-slate-100 h-2.5 rounded-full overflow-hidden">
@@ -633,6 +736,18 @@ export default function App() {
             {jobStatus?.status === 'failed' && (
               <div className="bg-rose-50 border border-rose-200 text-rose-800 p-4 rounded-xl text-sm">
                 Benchmark failed: {jobStatus.error}
+              </div>
+            )}
+
+            {activeRunData?.records?.some(r => r.failed) && (
+              <div className="bg-amber-50 border border-amber-200 text-amber-900 p-4 rounded-xl text-sm space-y-1">
+                <div className="font-semibold flex items-center gap-1.5">
+                  <XCircle className="w-4 h-4 text-amber-600" />
+                  {activeRunData.records.filter(r => r.failed).length} article(s) failed evaluation during this run
+                </div>
+                <p className="text-xs text-amber-800 font-mono">
+                  Sample error: {activeRunData.records.find(r => r.failed)?.error || 'Unknown error'}
+                </p>
               </div>
             )}
 
@@ -730,7 +845,7 @@ export default function App() {
                     <span className="text-xs text-slate-500">Open Compare for LLM vs Jev side by side</span>
                   </div>
                   <div className="divide-y divide-slate-100">
-                    {activeRunData.records?.filter(r => !r.skipped).map((record, i) => (
+                    {activeRunData.records?.filter(r => !r.skipped && !r.failed && r.metrics).map((record, i) => (
                       <div key={i} className="p-4 flex items-center justify-between gap-4 hover:bg-slate-50">
                         <div className="min-w-0">
                           <p className="font-semibold text-slate-900 text-sm truncate">{record.headline}</p>

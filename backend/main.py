@@ -34,9 +34,20 @@ app.add_middleware(
 # In-memory execution job tracking
 ACTIVE_JOBS: Dict[str, Dict[str, Any]] = {}
 
+BATCH_ARTICLES_PER_CONFIG = 50
+
 class RunBenchmarkRequest(BaseModel):
     blob_names: List[str]
     config_id: Optional[str] = None
+    noul_threshold: float = 0.50
+    model: Optional[str] = None
+    optimize_prompts: bool = False
+    # Baseline LLM cost override (USD/article). None keeps the configured default.
+    llm_cost_override_usd: Optional[float] = None
+
+
+class BatchBenchmarkRequest(BaseModel):
+    config_ids: List[str]
     noul_threshold: float = 0.50
     model: Optional[str] = None
     optimize_prompts: bool = False
@@ -194,106 +205,164 @@ def preview_payload(req: PreviewRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def execute_benchmark_task(job_id: str, req: RunBenchmarkRequest):
+async def execute_benchmark_task(
+    job_id: str,
+    req: RunBenchmarkRequest,
+    work_items: Optional[List[tuple[Optional[str], str]]] = None,
+):
     ACTIVE_JOBS[job_id]["status"] = "running"
     comparisons = []
-    total = len(req.blob_names)
+    items = work_items or [(req.config_id, blob_name) for blob_name in req.blob_names]
+    total = len(items)
+    config_ids = list(dict.fromkeys(cfg_id for cfg_id, _ in items if cfg_id))
+    config_totals: Dict[str, int] = {}
+    config_completed: Dict[str, int] = {}
+    for cfg_id, _ in items:
+        if cfg_id:
+            config_totals[cfg_id] = config_totals.get(cfg_id, 0) + 1
+            config_completed[cfg_id] = 0
+
     optimized_rubrics: Dict[str, tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    config_snapshots: Dict[str, Dict[str, Any]] = {}
+    lock = asyncio.Lock()
+    sem = asyncio.Semaphore(settings.BENCHMARK_CONCURRENCY)
 
     try:
-        run_folder = run_logger.create_run_session(job_id, req.config_id or "auto", total)
-        for idx, blob_name in enumerate(req.blob_names):
-            ACTIVE_JOBS[job_id]["current_index"] = idx + 1
-            ACTIVE_JOBS[job_id]["current_blob"] = blob_name
+        run_logger.create_run_session(
+            job_id,
+            config_ids[0] if len(config_ids) == 1 else "batch",
+            total,
+            config_ids=config_ids or None,
+        )
 
+        # Pre-fetch and cache configs & rubrics before starting parallel workers
+        for cfg_id in config_ids:
             try:
-                # 1. Fetch blob audit
-                blob_audit = blob_manager.get_blob(blob_name)
-                cfg_id = req.config_id or blob_audit.get("config_id")
-                # 2. Fetch config snapshot and optionally compile a cached optimized rubric.
+                config_data = config_manager.fetch_published_config(config_id=cfg_id)
+            except LookupError:
+                config_data = config_manager.fetch_historical_config(cfg_id)
+            config_snapshots[cfg_id] = config_data
+            if req.optimize_prompts and cfg_id not in optimized_rubrics:
+                ACTIVE_JOBS[job_id]["phase"] = "optimizing_prompts"
+                ACTIVE_JOBS[job_id]["optimizer_config"] = cfg_id
+                ACTIVE_JOBS[job_id]["optimizer_status"] = "compiling"
+                optimized_rubrics[cfg_id] = await prompt_optimizer.optimize_snapshot(
+                    config_data["snapshot"], config_data["metadata"]
+                )
+
+        ACTIVE_JOBS[job_id]["phase"] = "evaluating"
+
+        async def process_one(idx: int, item_config_id: Optional[str], blob_name: str):
+            async with sem:
                 try:
-                    config_data = config_manager.fetch_published_config(config_id=cfg_id)
-                except LookupError:
-                    config_data = config_manager.fetch_historical_config(cfg_id)
-                snapshot = config_data["snapshot"]
-                original_questions = convert_config_to_jev_questions(snapshot)
-                optimizer_metadata = {"enabled": False}
-                optimized_rubric = None
-                if req.optimize_prompts:
-                    ACTIVE_JOBS[job_id]["phase"] = "optimizing_prompts"
-                    ACTIVE_JOBS[job_id]["optimizer_config"] = cfg_id
-                    ACTIVE_JOBS[job_id]["optimizer_status"] = "compiling"
-                    if cfg_id not in optimized_rubrics:
-                        optimized_rubrics[cfg_id] = await prompt_optimizer.optimize_snapshot(
-                            snapshot, config_data["metadata"]
-                        )
-                    optimized_rubric, optimizer_metadata = optimized_rubrics[cfg_id]
-                    ACTIVE_JOBS[job_id]["optimizer_status"] = "cached" if optimizer_metadata.get("cached") else "compiled"
-                jev_questions = convert_config_to_jev_questions(snapshot, optimized_rubric)
-                if req.optimize_prompts:
-                    original_size = len(json.dumps(original_questions, ensure_ascii=False, separators=(",", ":")))
-                    optimized_size = len(json.dumps(jev_questions, ensure_ascii=False, separators=(",", ":")))
-                    optimizer_metadata = {
-                        **optimizer_metadata,
-                        "question_count": len(jev_questions),
-                        "original_question_chars": original_size,
-                        "optimized_question_chars": optimized_size,
-                        "estimated_char_reduction_pct": round(
-                            (original_size - optimized_size) / max(original_size, 1) * 100, 1
-                        ),
+                    blob_audit = blob_manager.get_blob(blob_name)
+                    cfg_id = item_config_id or req.config_id or blob_audit.get("config_id")
+
+                    if cfg_id in config_snapshots:
+                        config_data = config_snapshots[cfg_id]
+                    else:
+                        try:
+                            config_data = config_manager.fetch_published_config(config_id=cfg_id)
+                        except LookupError:
+                            config_data = config_manager.fetch_historical_config(cfg_id)
+                        config_snapshots[cfg_id] = config_data
+
+                    snapshot = config_data["snapshot"]
+                    optimized_rubric, optimizer_metadata = (
+                        optimized_rubrics.get(cfg_id, (None, {"enabled": False}))
+                    )
+                    jev_questions = convert_config_to_jev_questions(snapshot, optimized_rubric)
+
+                    state_text, _ = build_article_state(blob_audit)
+                    jev_result = await typesafe_runner.evaluate_article(
+                        state=state_text,
+                        questions=jev_questions,
+                        model=req.model,
+                    )
+
+                    comparison = compare_article_results(
+                        blob_audit=blob_audit,
+                        jev_result=jev_result,
+                        snapshot=snapshot,
+                        noul_threshold=req.noul_threshold,
+                        llm_cost_override_usd=req.llm_cost_override_usd,
+                    )
+                    comparison["config_version"] = config_data["metadata"]
+                    comparison["prompt_optimization"] = optimizer_metadata
+                    comparison["jev_request"] = jev_result.get("request_payload")
+                    comparison["jev_response"] = jev_result.get("raw_response")
+
+                    corr_id = blob_audit.get("correlation_id") or blob_name.replace(".json", "")
+                    record_key = f"{cfg_id}__{corr_id}" if work_items is not None else None
+                    run_logger.log_article_result(job_id, corr_id, comparison, record_key=record_key)
+
+                    async with lock:
+                        comparisons.append(comparison)
+                        processed_count = len(comparisons)
+                        ACTIVE_JOBS[job_id]["processed"] = processed_count
+                        ACTIVE_JOBS[job_id]["current_index"] = processed_count
+                        ACTIVE_JOBS[job_id]["current_blob"] = blob_name
+                        if item_config_id:
+                            config_completed[item_config_id] = config_completed.get(item_config_id, 0) + 1
+                            ACTIVE_JOBS[job_id].update({
+                                "current_config_id": item_config_id,
+                                "config_article_index": config_completed[item_config_id],
+                                "config_article_total": config_totals.get(item_config_id, 0),
+                                "config_index": (config_ids.index(item_config_id) + 1) if item_config_id in config_ids else 1,
+                                "config_total": len(config_ids),
+                            })
+
+                except LookupError as skip_err:
+                    reason = str(skip_err)
+                    logger.warning(f"Skipping {blob_name}: {reason}")
+                    skipped = {
+                        "blob_name": blob_name,
+                        "correlation_id": blob_name.replace(f"{settings.AUDIT_BLOB_SUFFIX}.json", "").replace(".json", ""),
+                        "config_id": item_config_id or req.config_id,
+                        "skipped": True,
+                        "reason": reason,
                     }
-                ACTIVE_JOBS[job_id]["phase"] = "evaluating"
+                    record_key = (
+                        f"{item_config_id or req.config_id}__{skipped['correlation_id']}"
+                        if work_items is not None else None
+                    )
+                    run_logger.log_article_result(
+                        job_id,
+                        skipped["correlation_id"] or blob_name,
+                        skipped,
+                        record_key=record_key,
+                    )
+                    async with lock:
+                        ACTIVE_JOBS[job_id].setdefault("skipped", []).append(blob_name)
+                except Exception as blob_err:
+                    logger.exception(f"Article {blob_name} failed: {blob_err}")
+                    failed_record = {
+                        "blob_name": blob_name,
+                        "correlation_id": blob_name.replace(f"{settings.AUDIT_BLOB_SUFFIX}.json", "").replace(".json", ""),
+                        "config_id": item_config_id or req.config_id,
+                        "failed": True,
+                        "error": str(blob_err),
+                    }
+                    record_key = (
+                        f"{item_config_id or req.config_id}__{failed_record['correlation_id']}"
+                        if work_items is not None else None
+                    )
+                    run_logger.log_article_result(
+                        job_id,
+                        failed_record["correlation_id"] or blob_name,
+                        failed_record,
+                        record_key=record_key,
+                    )
+                    async with lock:
+                        ACTIVE_JOBS[job_id].setdefault("failed_blobs", []).append(
+                            {"blob_name": blob_name, "error": str(blob_err)}
+                        )
 
-                # 3. Build state
-                state_text, _ = build_article_state(blob_audit)
-
-                # 4. Evaluate with Jev
-                jev_result = await typesafe_runner.evaluate_article(
-                    state=state_text,
-                    questions=jev_questions,
-                    model=req.model
-                )
-
-                # 5. Compare against LLM baseline
-                comparison = compare_article_results(
-                    blob_audit=blob_audit,
-                    jev_result=jev_result,
-                    snapshot=snapshot,
-                    noul_threshold=req.noul_threshold,
-                    llm_cost_override_usd=req.llm_cost_override_usd,
-                )
-                # Observability: retain the exact wire payload and response for this article.
-                comparison["config_version"] = config_data["metadata"]
-                comparison["prompt_optimization"] = optimizer_metadata
-                comparison["jev_request"] = jev_result.get("request_payload")
-                comparison["jev_response"] = jev_result.get("raw_response")
-                # 6. Log record
-                corr_id = blob_audit.get("correlation_id") or blob_name.replace(".json", "")
-                run_logger.log_article_result(job_id, corr_id, comparison)
-                comparisons.append(comparison)
-                ACTIVE_JOBS[job_id]["processed"] = len(comparisons)
-
-            except PromptOptimizationError:
-                raise
-            except LookupError as skip_err:
-                # Prod blobs can reference configs that are archived or lack an
-                # active published snapshot; record and continue the run.
-                reason = str(skip_err)
-                logger.warning(f"Skipping {blob_name}: {reason}")
-                skipped = {
-                    "blob_name": blob_name,
-                    "correlation_id": blob_name.replace(f"{settings.AUDIT_BLOB_SUFFIX}.json", "").replace(".json", ""),
-                    "skipped": True,
-                    "reason": reason,
-                }
-                run_logger.log_article_result(job_id, skipped["correlation_id"] or blob_name, skipped)
-                ACTIVE_JOBS[job_id].setdefault("skipped", []).append(blob_name)
-            except Exception as blob_err:
-                logger.exception(f"Article {blob_name} failed; aborting run: {blob_err}")
-                ACTIVE_JOBS[job_id].setdefault("failed_blobs", []).append(
-                    {"blob_name": blob_name, "error": str(blob_err)}
-                )
-                raise
+        tasks = [
+            process_one(idx, item_config_id, blob_name)
+            for idx, (item_config_id, blob_name) in enumerate(items)
+        ]
+        await asyncio.gather(*tasks)
 
         summary = run_logger.finalize_run(job_id, comparisons)
         ACTIVE_JOBS[job_id]["status"] = "completed"
@@ -304,6 +373,7 @@ async def execute_benchmark_task(job_id: str, req: RunBenchmarkRequest):
         logger.exception(f"Error in benchmark job {job_id}: {e}")
         ACTIVE_JOBS[job_id]["status"] = "failed"
         ACTIVE_JOBS[job_id]["error"] = str(e)
+
 
 @app.post("/api/benchmark/run")
 async def start_benchmark(req: RunBenchmarkRequest, background_tasks: BackgroundTasks):
@@ -335,6 +405,72 @@ async def start_benchmark(req: RunBenchmarkRequest, background_tasks: Background
     
     background_tasks.add_task(execute_benchmark_task, job_id, req)
     return {"job_id": job_id, "status": "started", "total": len(req.blob_names)}
+
+@app.post("/api/benchmark/batch-run")
+async def start_batch_benchmark(req: BatchBenchmarkRequest, background_tasks: BackgroundTasks):
+    config_ids = list(dict.fromkeys(config_id.strip() for config_id in req.config_ids if config_id and config_id.strip()))
+    if not config_ids:
+        raise HTTPException(status_code=400, detail="Must provide at least one config ID")
+    if req.optimize_prompts and not settings.PROMPT_OPTIMIZATION_ENABLED:
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt optimization is disabled; set PROMPT_OPTIMIZATION_ENABLED=true",
+        )
+    if req.optimize_prompts and not settings.GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt optimization requires GEMINI_API_KEY in the environment",
+        )
+
+    # Select the newest indexed articles once, then preserve config and article
+    # order while the background task evaluates them sequentially.
+    work_items: List[tuple[Optional[str], str]] = []
+    config_counts = []
+    for config_id in config_ids:
+        articles = audit_index.list_articles(config_id=config_id, limit=BATCH_ARTICLES_PER_CONFIG)
+        names = [article["name"] for article in articles]
+        work_items.extend((config_id, name) for name in names)
+        config_counts.append({
+            "config_id": config_id,
+            "requested": BATCH_ARTICLES_PER_CONFIG,
+            "selected": len(names),
+        })
+
+    if not work_items:
+        raise HTTPException(status_code=400, detail="None of the selected configs has processed articles")
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    job_id = f"batch_run_{timestamp}_{len(config_ids)}_configs"
+    total = len(work_items)
+    ACTIVE_JOBS[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "phase": "starting",
+        "mode": "batch",
+        "config_ids": config_ids,
+        "config_counts": config_counts,
+        "articles_per_config": BATCH_ARTICLES_PER_CONFIG,
+        "total": total,
+        "processed": 0,
+        "optimize_prompts": req.optimize_prompts,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
+    execution_req = RunBenchmarkRequest(
+        blob_names=[],
+        noul_threshold=req.noul_threshold,
+        model=req.model,
+        optimize_prompts=req.optimize_prompts,
+        llm_cost_override_usd=req.llm_cost_override_usd,
+    )
+    background_tasks.add_task(execute_benchmark_task, job_id, execution_req, work_items)
+    return {
+        "job_id": job_id,
+        "status": "started",
+        "mode": "batch",
+        "config_counts": config_counts,
+        "total": total,
+    }
 
 @app.get("/api/benchmark/jobs/{job_id}")
 def get_job_status(job_id: str):
