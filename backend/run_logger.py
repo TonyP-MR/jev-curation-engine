@@ -93,6 +93,25 @@ class RunLogger:
         sent_acc = pct(sent_correct, sent_total)
         tag_acc = pct(tag_correct, tag_total)
 
+        optimizer_records = [c.get("prompt_optimization") for c in comparisons if c.get("prompt_optimization", {}).get("enabled")]
+        optimizer_by_cache = {
+            r.get("cache_key"): r for r in optimizer_records if r.get("cache_key")
+        }
+        optimizer_summary = {
+            "enabled": bool(optimizer_records),
+            "configs_compiled": len(optimizer_by_cache),
+            "optimizer_cost_usd": round(sum(r.get("cost_usd", 0.0) for r in optimizer_by_cache.values()), 6),
+            "optimizer_duration_ms": round(sum(r.get("duration_ms", 0.0) for r in optimizer_by_cache.values()), 2),
+            "original_question_chars": sum(r.get("original_question_chars", 0) for r in optimizer_by_cache.values()),
+            "optimized_question_chars": sum(r.get("optimized_question_chars", 0) for r in optimizer_by_cache.values()),
+        }
+        if optimizer_summary["original_question_chars"]:
+            optimizer_summary["estimated_char_reduction_pct"] = round(
+                (optimizer_summary["original_question_chars"] - optimizer_summary["optimized_question_chars"])
+                / optimizer_summary["original_question_chars"] * 100,
+                1,
+            )
+
         summary = {
             "run_id": run_id,
             "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -119,6 +138,7 @@ class RunLogger:
                     "total": tag_total
                 }
             },
+            "prompt_optimization": optimizer_summary,
             "performance": {
                 "avg_llm_duration_ms": avg_llm_duration,
                 "avg_jev_duration_ms": avg_jev_duration,

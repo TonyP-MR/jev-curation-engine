@@ -196,7 +196,8 @@ export default function App() {
   const [search, setSearch] = useState('');
   const [runs, setRuns] = useState([]);
   const [llmCostOverride, setLlmCostOverride] = useState('');
-
+  const [optimizePrompts, setOptimizePrompts] = useState(false);
+  const [optimizerAvailable, setOptimizerAvailable] = useState(false);
   const [jobId, setJobId] = useState(null);
   const [jobStatus, setJobStatus] = useState(null);
   const [activeRunData, setActiveRunData] = useState(null);
@@ -206,7 +207,6 @@ export default function App() {
   const [preview, setPreview] = useState(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewTab, setPreviewTab] = useState('request');
-
   const [detail, setDetail] = useState(null);
 
   const configCounts = useMemo(() => {
@@ -226,6 +226,7 @@ export default function App() {
         setConfigs(dbConfigs);
         setRuns(runList);
         if (health?.environment) setEnvironment(health.environment);
+        setOptimizerAvailable(Boolean(health?.prompt_optimization_enabled && health?.prompt_optimization_key_configured));
         const latest = dbConfigs.find(c => c.config_id === health?.latest_audit_config);
         setSelectedConfig(latest?.config_id || dbConfigs[0]?.config_id || '');
       } catch (e) {
@@ -311,7 +312,8 @@ export default function App() {
       const payload = {
         blob_names: selectedBlobs,
         config_id: selectedConfig,
-        noul_threshold: 0.5
+        noul_threshold: 0.5,
+        optimize_prompts: optimizePrompts
       };
       const override = parseFloat(llmCostOverride);
       if (!Number.isNaN(override)) payload.llm_cost_override_usd = override;
@@ -408,6 +410,7 @@ export default function App() {
   );
 
   const summary = activeRunData?.summary;
+  const optimizerInfo = activeRunData?.records?.find(r => r.prompt_optimization?.enabled)?.prompt_optimization;
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
@@ -498,6 +501,16 @@ export default function App() {
                   className="px-3 py-2 border border-slate-300 rounded-lg text-sm w-36 bg-slate-50 font-mono"
                 />
               </div>
+              <label className={`flex items-center gap-2 text-xs whitespace-nowrap ${optimizerAvailable ? 'text-slate-600 cursor-pointer' : 'text-slate-400 cursor-not-allowed'}`} title={optimizerAvailable ? 'Compile the configuration rules with Gemini once, then reuse the cached rubric for this run.' : 'Add GEMINI_API_KEY and set PROMPT_OPTIMIZATION_ENABLED=true to enable this option.'}>
+                <input
+                  type="checkbox"
+                  checked={optimizePrompts}
+                  disabled={!optimizerAvailable}
+                  onChange={e => setOptimizePrompts(e.target.checked)}
+                  className="h-4 w-4 rounded border-slate-300 text-[#0b82f4] disabled:opacity-50"
+                />
+                Optimize prompts with Gemini
+              </label>
 
               <div className="ml-auto w-full lg:w-auto flex flex-wrap items-center justify-end gap-2">
                 <span className="text-sm text-slate-600 whitespace-nowrap">
@@ -597,16 +610,21 @@ export default function App() {
               <div className="bg-white p-6 rounded-xl border border-blue-200 shadow-sm flex items-center justify-between">
                 <div>
                   <h4 className="font-semibold text-slate-900 text-sm flex items-center gap-2">
-                    <RotateCw className="w-4 h-4 text-blue-600 animate-spin" /> Evaluating with TypeSafe Jev…
+                    <RotateCw className="w-4 h-4 text-blue-600 animate-spin" />
+                    {jobStatus.phase === 'optimizing_prompts'
+                      ? `Optimizing prompts for ${jobStatus.optimizer_config || 'configuration'}…`
+                      : 'Evaluating with TypeSafe Jev…'}
                   </h4>
                   <p className="text-xs text-slate-500 mt-1">
-                    {jobStatus.processed || 0} / {jobStatus.total} articles
+                    {jobStatus.phase === 'optimizing_prompts'
+                      ? `Gemini ${jobStatus.optimizer_status || 'compiling'} rubric before article evaluation`
+                      : `${jobStatus.processed || 0} / ${jobStatus.total} articles`}
                   </p>
                 </div>
                 <div className="w-48 bg-slate-100 h-2.5 rounded-full overflow-hidden">
                   <div
                     className="bg-[#0b82f4] h-full transition-all"
-                    style={{ width: `${Math.round(((jobStatus.processed || 0) / (jobStatus.total || 1)) * 100)}%` }}
+                    style={{ width: `${jobStatus.phase === 'optimizing_prompts' ? 8 : Math.round(((jobStatus.processed || 0) / (jobStatus.total || 1)) * 100)}%` }}
                   />
                 </div>
               </div>
@@ -680,6 +698,16 @@ export default function App() {
                       {copiedMd ? 'Copied' : 'Copy Markdown'}
                     </button>
                   </div>
+                  {optimizerInfo && (
+                    <div className="mt-3 px-3 py-2 rounded-lg bg-violet-50 border border-violet-200 text-xs text-violet-800">
+                      Prompt optimizer: {optimizerInfo.model} · {optimizerInfo.cached ? 'cached rubric' : 'compiled this run'} · optimizer cost ${Number(optimizerInfo.cost_usd || 0).toFixed(6)}
+                    </div>
+                  )}
+                  {summary.prompt_optimization?.enabled && (
+                    <div className="mt-2 px-3 py-2 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600">
+                      Question payload: {summary.prompt_optimization.original_question_chars.toLocaleString()} → {summary.prompt_optimization.optimized_question_chars.toLocaleString()} characters ({summary.prompt_optimization.estimated_char_reduction_pct ?? 0}% estimated reduction) across {summary.prompt_optimization.configs_compiled} config(s).
+                    </div>
+                  )}
                   <div className="mt-4 p-5 bg-white border border-slate-200 rounded-lg max-h-[34rem] overflow-auto">
                     <MarkdownReport source={activeRunData.markdown_report} />
                   </div>

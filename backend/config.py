@@ -13,6 +13,9 @@ _MANAGED_KEYS = [
     "AUDIT_BLOB_ACCOUNT_URL", "AUDIT_BLOB_CONTAINER", "AUDIT_BLOB_SUFFIX",
     "AZURE_STORAGE_ACCOUNT", "AZURE_STORAGE_KEY",
     "TYPESAFE_API_KEY", "TYPESAFE_MODEL", "TYPESAFE_API_BASE",
+    "JEV_PROVIDER", "OPENROUTER_API_KEY", "OPENROUTER_JEV_API_KEY",
+    "OPENROUTER_BASE_URL", "OPENROUTER_JEV_MODEL", "OPENROUTER_APP_TITLE",
+    "GEMINI_API_KEY", "GEMINI_OPTIMIZER_MODEL", "PROMPT_OPTIMIZATION_ENABLED",
     "LLM_INPUT_COST_PER_MTOK", "LLM_OUTPUT_COST_PER_MTOK",
     "LLM_FLAT_COST_PER_ARTICLE_USD",
 ]
@@ -82,8 +85,15 @@ class Settings(BaseSettings):
     TYPESAFE_API_KEY: str = ""
     TYPESAFE_API_BASE: str = "https://api.typesafe.ai/v1"
     TYPESAFE_MODEL: str = "jev-latest"
-    # --- Jev pricing ---
-    # Charged per input token only: $42/Btok = $0.042/Mtok. Output tokens are free.
+    JEV_PROVIDER: str = "typesafe"
+    OPENROUTER_API_KEY: str = ""
+    OPENROUTER_JEV_API_KEY: str = ""
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai"
+    OPENROUTER_JEV_MODEL: str = "typesafe/jev-1.13"
+    OPENROUTER_APP_TITLE: str = "jev-curation-engine"
+    GEMINI_API_KEY: str = ""
+    GEMINI_OPTIMIZER_MODEL: str = "gemini-2.5-flash"
+    PROMPT_OPTIMIZATION_ENABLED: bool = False
     TYPESAFE_COST_PER_MILLION_INPUT_TOKENS: float = 0.042
 
     # --- Baseline LLM pricing (used when the blob has no recorded cost) ---

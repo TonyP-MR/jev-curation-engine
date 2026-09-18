@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import json
 import logging
 from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -11,6 +12,7 @@ print(f"[startup] ENVIRONMENT={settings.ENVIRONMENT} MYSQL_HOST={settings.MYSQL_
 from config_manager import config_manager
 from audit_index import audit_index
 from blob_manager import blob_manager
+from prompt_optimizer import PromptOptimizationError, prompt_optimizer
 from question_converter import build_article_state, convert_config_to_jev_questions
 from typesafe_runner import typesafe_runner
 from comparator import compare_article_results
@@ -37,6 +39,7 @@ class RunBenchmarkRequest(BaseModel):
     config_id: Optional[str] = None
     noul_threshold: float = 0.50
     model: Optional[str] = None
+    optimize_prompts: bool = False
     # Baseline LLM cost override (USD/article). None keeps the configured default.
     llm_cost_override_usd: Optional[float] = None
 
@@ -51,7 +54,11 @@ def health_check():
         "status": "healthy",
         "environment": settings.ENVIRONMENT,
         "typesafe_model": settings.TYPESAFE_MODEL,
+        "jev_provider": settings.JEV_PROVIDER,
+        "jev_model": settings.OPENROUTER_JEV_MODEL if settings.JEV_PROVIDER.lower() == "openrouter" else settings.TYPESAFE_MODEL,
         "latest_audit_config": audit_index.latest_config_id(),
+        "prompt_optimization_enabled": settings.PROMPT_OPTIMIZATION_ENABLED,
+        "prompt_optimization_key_configured": bool(settings.GEMINI_API_KEY),
     }
 
 @app.get("/api/configs")
@@ -152,7 +159,10 @@ def preview_payload(req: PreviewRequest):
         if not cfg_id:
             raise HTTPException(status_code=400, detail="No config_id supplied or archived on blob")
 
-        config_data = config_manager.fetch_published_config(config_id=cfg_id)
+        try:
+            config_data = config_manager.fetch_published_config(config_id=cfg_id)
+        except LookupError:
+            config_data = config_manager.fetch_historical_config(cfg_id)
         if not config_data:
             raise HTTPException(status_code=404, detail=f"No published config for {cfg_id}")
         snapshot = config_data["snapshot"]
@@ -188,6 +198,7 @@ async def execute_benchmark_task(job_id: str, req: RunBenchmarkRequest):
     ACTIVE_JOBS[job_id]["status"] = "running"
     comparisons = []
     total = len(req.blob_names)
+    optimized_rubrics: Dict[str, tuple[Dict[str, Any], Dict[str, Any]]] = {}
 
     try:
         run_folder = run_logger.create_run_session(job_id, req.config_id or "auto", total)
@@ -199,13 +210,39 @@ async def execute_benchmark_task(job_id: str, req: RunBenchmarkRequest):
                 # 1. Fetch blob audit
                 blob_audit = blob_manager.get_blob(blob_name)
                 cfg_id = req.config_id or blob_audit.get("config_id")
-                if not cfg_id:
-                    raise LookupError("blob has no config_id")
-
-                # 2. Fetch config snapshot & convert questions
-                config_data = config_manager.fetch_published_config(config_id=cfg_id)
+                # 2. Fetch config snapshot and optionally compile a cached optimized rubric.
+                try:
+                    config_data = config_manager.fetch_published_config(config_id=cfg_id)
+                except LookupError:
+                    config_data = config_manager.fetch_historical_config(cfg_id)
                 snapshot = config_data["snapshot"]
-                jev_questions = convert_config_to_jev_questions(snapshot)
+                original_questions = convert_config_to_jev_questions(snapshot)
+                optimizer_metadata = {"enabled": False}
+                optimized_rubric = None
+                if req.optimize_prompts:
+                    ACTIVE_JOBS[job_id]["phase"] = "optimizing_prompts"
+                    ACTIVE_JOBS[job_id]["optimizer_config"] = cfg_id
+                    ACTIVE_JOBS[job_id]["optimizer_status"] = "compiling"
+                    if cfg_id not in optimized_rubrics:
+                        optimized_rubrics[cfg_id] = await prompt_optimizer.optimize_snapshot(
+                            snapshot, config_data["metadata"]
+                        )
+                    optimized_rubric, optimizer_metadata = optimized_rubrics[cfg_id]
+                    ACTIVE_JOBS[job_id]["optimizer_status"] = "cached" if optimizer_metadata.get("cached") else "compiled"
+                jev_questions = convert_config_to_jev_questions(snapshot, optimized_rubric)
+                if req.optimize_prompts:
+                    original_size = len(json.dumps(original_questions, ensure_ascii=False, separators=(",", ":")))
+                    optimized_size = len(json.dumps(jev_questions, ensure_ascii=False, separators=(",", ":")))
+                    optimizer_metadata = {
+                        **optimizer_metadata,
+                        "question_count": len(jev_questions),
+                        "original_question_chars": original_size,
+                        "optimized_question_chars": optimized_size,
+                        "estimated_char_reduction_pct": round(
+                            (original_size - optimized_size) / max(original_size, 1) * 100, 1
+                        ),
+                    }
+                ACTIVE_JOBS[job_id]["phase"] = "evaluating"
 
                 # 3. Build state
                 state_text, _ = build_article_state(blob_audit)
@@ -227,15 +264,17 @@ async def execute_benchmark_task(job_id: str, req: RunBenchmarkRequest):
                 )
                 # Observability: retain the exact wire payload and response for this article.
                 comparison["config_version"] = config_data["metadata"]
+                comparison["prompt_optimization"] = optimizer_metadata
                 comparison["jev_request"] = jev_result.get("request_payload")
                 comparison["jev_response"] = jev_result.get("raw_response")
-
                 # 6. Log record
                 corr_id = blob_audit.get("correlation_id") or blob_name.replace(".json", "")
                 run_logger.log_article_result(job_id, corr_id, comparison)
                 comparisons.append(comparison)
                 ACTIVE_JOBS[job_id]["processed"] = len(comparisons)
 
+            except PromptOptimizationError:
+                raise
             except LookupError as skip_err:
                 # Prod blobs can reference configs that are archived or lack an
                 # active published snapshot; record and continue the run.
@@ -250,12 +289,12 @@ async def execute_benchmark_task(job_id: str, req: RunBenchmarkRequest):
                 run_logger.log_article_result(job_id, skipped["correlation_id"] or blob_name, skipped)
                 ACTIVE_JOBS[job_id].setdefault("skipped", []).append(blob_name)
             except Exception as blob_err:
-                logger.exception(f"Article {blob_name} failed; continuing run: {blob_err}")
+                logger.exception(f"Article {blob_name} failed; aborting run: {blob_err}")
                 ACTIVE_JOBS[job_id].setdefault("failed_blobs", []).append(
                     {"blob_name": blob_name, "error": str(blob_err)}
                 )
+                raise
 
-        # Finalize run
         summary = run_logger.finalize_run(job_id, comparisons)
         ACTIVE_JOBS[job_id]["status"] = "completed"
         ACTIVE_JOBS[job_id]["summary"] = summary
@@ -270,6 +309,16 @@ async def execute_benchmark_task(job_id: str, req: RunBenchmarkRequest):
 async def start_benchmark(req: RunBenchmarkRequest, background_tasks: BackgroundTasks):
     if not req.blob_names:
         raise HTTPException(status_code=400, detail="Must provide at least one blob name")
+    if req.optimize_prompts and not settings.PROMPT_OPTIMIZATION_ENABLED:
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt optimization is disabled; set PROMPT_OPTIMIZATION_ENABLED=true",
+        )
+    if req.optimize_prompts and not settings.GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt optimization requires GEMINI_API_KEY in the environment",
+        )
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     job_id = f"run_{timestamp}_{len(req.blob_names)}_items"
@@ -277,8 +326,10 @@ async def start_benchmark(req: RunBenchmarkRequest, background_tasks: Background
     ACTIVE_JOBS[job_id] = {
         "job_id": job_id,
         "status": "pending",
+        "phase": "starting",
         "total": len(req.blob_names),
         "processed": 0,
+        "optimize_prompts": req.optimize_prompts,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }
     

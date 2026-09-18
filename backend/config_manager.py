@@ -31,6 +31,23 @@ WHERE c.identifier = %s
 ORDER BY vs.version_number DESC
 LIMIT 1;
 """
+HISTORICAL_BY_CONFIG_ID_SQL = """
+SELECT
+    c.id AS numeric_config_id,
+    c.identifier AS config_id,
+    c.name AS config_name,
+    vs.version_number,
+    vs.snapshot_data,
+    vs.published_at,
+    c.status,
+    c.is_archived
+FROM configurations AS c
+INNER JOIN cfg_version_snapshots AS vs
+    ON vs.configuration_id = c.id
+WHERE c.identifier = %s
+ORDER BY vs.version_number DESC
+LIMIT 1;
+"""
 
 PUBLISHED_BY_TRACKER_ID_SQL = """
 SELECT
@@ -162,6 +179,40 @@ class ConfigManager:
                     self.save_cached_config(row["config_id"], result)
 
                 return result
+        finally:
+            conn.close()
+
+    def fetch_historical_config(self, config_id: str) -> Dict[str, Any]:
+        """Load the newest stored snapshot even when the config is inactive."""
+        cache_key = f"audit_{config_id}"
+        cached = self.get_cached_config(cache_key)
+        if cached:
+            return cached
+
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(HISTORICAL_BY_CONFIG_ID_SQL, (config_id,))
+                row = cursor.fetchone()
+            if not row:
+                raise LookupError(f"No stored config snapshot found for {config_id}")
+            raw_snapshot = row["snapshot_data"]
+            snapshot = json.loads(raw_snapshot) if isinstance(raw_snapshot, str) else raw_snapshot
+            result = {
+                "metadata": {
+                    "numeric_config_id": row["numeric_config_id"],
+                    "config_id": row["config_id"],
+                    "config_name": row["config_name"],
+                    "version_number": row["version_number"],
+                    "published_at": str(row["published_at"]) if row["published_at"] else None,
+                    "lookup_mode": "historical_snapshot",
+                    "config_status": row["status"],
+                    "is_archived": bool(row["is_archived"]),
+                },
+                "snapshot": snapshot,
+            }
+            self.save_cached_config(cache_key, result)
+            return result
         finally:
             conn.close()
 

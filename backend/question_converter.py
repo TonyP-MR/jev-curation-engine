@@ -41,25 +41,34 @@ def build_article_state(blob_data: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]
     }
     return state_text, metadata
 
-def convert_config_to_jev_questions(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def convert_config_to_jev_questions(
+    snapshot: Dict[str, Any],
+    optimized_rubric: Dict[str, Any] | None = None,
+) -> Dict[str, Dict[str, Any]]:
     """
     Transforms Curation Engine subjects and LLM tags into typed TypeSafe Jev questions.
-    Questions:
-      - subj_{subject_id}_valid: Noul (Subject validation)
-      - subj_{subject_id}_prominence: Choice (primary, significant, passing)
-      - subj_{subject_id}_sentiment: Choice (positive, negative, neutral, balanced)
-      - tag_{subject_id}_{tag_id}: Noul (LLM tag evaluation)
+    An optional optimized rubric replaces only the client rule text; canonical labels
+    and question types remain controlled by this converter.
     """
     questions: Dict[str, Dict[str, Any]] = {}
     subjects = snapshot.get("subjects", [])
+    optimized_subjects = {
+        str(s.get("subject_id")): s
+        for s in (optimized_rubric or {}).get("subjects", [])
+    }
 
     for s in subjects:
         s_id = str(s["id"])
         name = s.get("name") or f"Subject {s_id}"
         entity_def = sanitize_heading(s.get("entity_definition") or "")
-        val_prompt = sanitize_heading(s.get("validation_prompt") or "")
-        prom_prompt = sanitize_heading(s.get("prominence_prompt") or "")
-        sent_prompt = sanitize_heading(s.get("sentiment_prompt") or "")
+        rubric = optimized_subjects.get(s_id) or {}
+        val_prompt = sanitize_heading(rubric.get("validation_criteria") or s.get("validation_prompt") or "")
+        prom_prompt = sanitize_heading(rubric.get("prominence_criteria") or s.get("prominence_prompt") or "")
+        sent_prompt = sanitize_heading(rubric.get("sentiment_criteria") or s.get("sentiment_prompt") or "")
+        optimized_tags = {
+            str(tag.get("tag_id")): tag.get("criteria", "")
+            for tag in rubric.get("tags", [])
+        }
 
         # 1. Subject Validation (Noul)
         val_instructions = f"Is the provided content meaningfully relevant to '{name}' based on the validation criteria?"
@@ -74,10 +83,16 @@ def convert_config_to_jev_questions(snapshot: Dict[str, Any]) -> Dict[str, Dict[
         }
 
         # 2. Prominence (Choice: primary, significant, passing)
-        prom_instructions = f"What is the prominence of '{name}' in this content?"
+        prom_instructions = (
+            f"What is the prominence of '{name}' in this content? "
+            "Return exactly one API choice: primary, significant, or passing. "
+            "If the client criteria uses 'Prime', treat it as the primary choice."
+        )
+        if prom_prompt:
+            prom_instructions += f"\n\nApply these client-specific prominence criteria:\n{prom_prompt}"
         prom_criteria = {
-            "primary": f"Primary focus of the article/clip. {prom_prompt}".strip(),
-            "significant": "Significant mention, key topic or major discussion, but not the exclusive main topic.",
+            "primary": "Primary focus of the article or clip.",
+            "significant": "Significant mention, key topic, or major discussion, but not the exclusive main topic.",
             "passing": "Minor, passing reference, incidental mention, or brief quote."
         }
         questions[f"subj_{s_id}_prominence"] = {
@@ -88,11 +103,13 @@ def convert_config_to_jev_questions(snapshot: Dict[str, Any]) -> Dict[str, Dict[
 
         # 3. Sentiment (Choice: positive, negative, neutral, balanced)
         sent_instructions = f"What is the tone and sentiment towards '{name}' in this content?"
+        if sent_prompt:
+            sent_instructions += f"\n\nApply these client-specific sentiment criteria:\n{sent_prompt}"
         sent_criteria = {
-            "positive": f"Favorable coverage, accomplishments, praise, or positive development. {sent_prompt}".strip(),
+            "positive": "Favorable coverage, accomplishments, praise, or positive development.",
             "negative": "Adverse coverage, criticism, scandal, controversies, or poor performance.",
-            "neutral": "Factual reporting, balanced without slant, matter-of-fact mention.",
-            "balanced": "Contains substantial elements of both positive and negative sentiment."
+            "neutral": "Factual reporting without a clear positive or negative tone.",
+            "balanced": "Substantial elements of both positive and negative sentiment."
         }
         questions[f"subj_{s_id}_sentiment"] = {
             "type": "choice",
@@ -105,7 +122,7 @@ def convert_config_to_jev_questions(snapshot: Dict[str, Any]) -> Dict[str, Dict[
             if t.get("evaluation_type") == "llm" and t.get("prompt_text"):
                 t_id = t["tag_id"]
                 t_name = t.get("tag_name") or t_id
-                t_criteria = sanitize_heading(t["prompt_text"])
+                t_criteria = sanitize_heading(optimized_tags.get(str(t_id)) or t.get("prompt_text") or "")
                 
                 questions[f"tag_{s_id}_{t_id}"] = {
                     "type": "noul",
