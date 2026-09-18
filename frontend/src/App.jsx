@@ -39,6 +39,99 @@ async function apiPost(path, body) {
   return res.json();
 }
 
+function formatJsonForDisplay(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  return text.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+}
+
+function inlineMarkdown(text, keyPrefix) {
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g);
+  return parts.map((part, index) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={`${keyPrefix}-b-${index}`}>{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith('`') && part.endsWith('`')) {
+      return <code key={`${keyPrefix}-c-${index}`} className="font-mono text-blue-700">{part.slice(1, -1)}</code>;
+    }
+    return <React.Fragment key={`${keyPrefix}-t-${index}`}>{part}</React.Fragment>;
+  });
+}
+
+function splitMarkdownTableRow(line) {
+  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim());
+}
+
+function MarkdownReport({ source }) {
+  const lines = String(source || '').split(/\r?\n/);
+  const blocks = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    if (line.trim().startsWith('|') && index + 1 < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[index + 1])) {
+      const headers = splitMarkdownTableRow(line);
+      index += 2;
+      const rows = [];
+      while (index < lines.length && lines[index].trim().startsWith('|')) {
+        rows.push(splitMarkdownTableRow(lines[index]));
+        index += 1;
+      }
+      blocks.push(
+        <div key={`table-${index}`} className="overflow-x-auto my-4">
+          <table className="min-w-full text-left text-xs border-collapse">
+            <thead>
+              <tr className="border-b border-slate-300 bg-slate-100">
+                {headers.map((header, i) => <th key={i} className="px-3 py-2 font-semibold text-slate-700">{inlineMarkdown(header, `h-${index}-${i}`)}</th>)}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, r) => (
+                <tr key={r} className="border-b border-slate-200 even:bg-slate-50">
+                  {headers.map((_, c) => <td key={c} className="px-3 py-2 text-slate-700 align-top">{inlineMarkdown(row[c] || '', `r-${index}-${r}-${c}`)}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      const Tag = level === 1 ? 'h2' : level === 2 ? 'h3' : 'h4';
+      blocks.push(<Tag key={`heading-${index}`} className="font-bold text-slate-900 mt-5 mb-2">{inlineMarkdown(heading[2], `heading-${index}`)}</Tag>);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*-\s+/.test(line)) {
+      const items = [];
+      while (index < lines.length && /^\s*-\s+/.test(lines[index])) {
+        items.push(lines[index].replace(/^\s*-\s+/, ''));
+        index += 1;
+      }
+      blocks.push(<ul key={`list-${index}`} className="list-disc pl-5 my-3 space-y-1">{items.map((item, i) => <li key={i}>{inlineMarkdown(item, `li-${index}-${i}`)}</li>)}</ul>);
+      continue;
+    }
+
+    const paragraph = [];
+    while (index < lines.length && lines[index].trim() && !/^#{1,4}\s+/.test(lines[index]) && !/^\s*-\s+/.test(lines[index]) && !lines[index].trim().startsWith('|')) {
+      paragraph.push(lines[index].trim());
+      index += 1;
+    }
+    blocks.push(<p key={`paragraph-${index}`} className="my-3 leading-relaxed">{inlineMarkdown(paragraph.join(' '), `p-${index}`)}</p>);
+  }
+
+  return <div className="text-sm text-slate-700">{blocks}</div>;
+}
+
 function StatCard({ label, value, sub, icon, tone = 'slate' }) {
   const tones = {
     slate: 'text-slate-900',
@@ -84,7 +177,7 @@ function Modal({ title, subtitle, onClose, children, wide = false }) {
 }
 
 function JsonBlock({ value, maxHeight = 'max-h-80' }) {
-  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  const text = formatJsonForDisplay(value);
   return (
     <pre className={`p-3 bg-slate-900 text-slate-100 rounded-lg text-[11px] font-mono overflow-auto ${maxHeight} leading-relaxed whitespace-pre-wrap`}>
       {text}
@@ -585,9 +678,9 @@ export default function App() {
                       {copiedMd ? 'Copied' : 'Copy Markdown'}
                     </button>
                   </div>
-                  <pre className="mt-4 p-4 bg-slate-900 text-slate-100 rounded-lg text-xs font-mono overflow-x-auto leading-relaxed whitespace-pre-wrap">
-                    {activeRunData.markdown_report}
-                  </pre>
+                  <div className="mt-4 p-5 bg-white border border-slate-200 rounded-lg max-h-[34rem] overflow-auto">
+                    <MarkdownReport source={activeRunData.markdown_report} />
+                  </div>
                 </div>
 
                 <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
@@ -825,10 +918,10 @@ export default function App() {
                 {detail.llm_output?.subjects?.map(llmSub => {
                   const jevSub = detail.jev_output?.subjects?.find(s => s.subject_id === llmSub.subject_id);
                   const row = (label, llmVal, jevVal, match) => (
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="text-slate-500 w-24 shrink-0">{label}</span>
-                      <span className="font-mono text-slate-700 flex-1 truncate">{String(llmVal)}</span>
-                      <span className="font-mono text-slate-700 flex-1 truncate">{String(jevVal)}</span>
+                    <div className="grid grid-cols-[6rem_minmax(0,1fr)_minmax(0,1fr)_1.25rem] items-center gap-2">
+                      <span className="text-slate-500">{label}</span>
+                      <span className="font-mono text-slate-700 min-w-0 truncate text-left">{String(llmVal)}</span>
+                      <span className="font-mono text-slate-700 min-w-0 truncate text-left">{String(jevVal)}</span>
                       <span className="w-5 shrink-0">
                         {match ? (
                           <CheckCircle2 className="w-4 h-4 text-emerald-500" />
@@ -841,11 +934,11 @@ export default function App() {
                   return (
                     <div key={llmSub.subject_id} className="p-3 bg-slate-50 rounded-lg border border-slate-200">
                       <div className="font-bold text-slate-800 text-sm mb-2">{llmSub.name}</div>
-                      <div className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-slate-400 font-semibold mb-1">
-                        <span className="w-24 shrink-0"></span>
-                        <span className="flex-1">LLM</span>
-                        <span className="flex-1">Jev</span>
-                        <span className="w-5"></span>
+                      <div className="grid grid-cols-[6rem_minmax(0,1fr)_minmax(0,1fr)_1.25rem] items-center gap-2 text-[10px] uppercase tracking-wider text-slate-400 font-semibold mb-1">
+                        <span></span>
+                        <span>LLM</span>
+                        <span>Jev</span>
+                        <span></span>
                       </div>
                       <div className="space-y-1 text-xs">
                         {row(
@@ -864,10 +957,10 @@ export default function App() {
                               x => x.tag_id === t.tag_id && x.subject_id === llmSub.subject_id
                             );
                             return (
-                              <div key={t.tag_id} className="flex items-center justify-between gap-2">
-                                <span className="text-slate-500 truncate">{t.tag_name}</span>
-                                <span className="font-mono text-slate-700">{String(llmTag?.llm_result)}</span>
-                                <span className="font-mono text-slate-700">
+                              <div key={t.tag_id} className="grid grid-cols-[minmax(0,1.4fr)_minmax(5rem,0.7fr)_minmax(0,1fr)_1.25rem] items-center gap-2">
+                                <span className="text-slate-500 min-w-0 truncate text-left">{t.tag_name}</span>
+                                <span className="font-mono text-slate-700 text-left">{String(llmTag?.llm_result)}</span>
+                                <span className="font-mono text-slate-700 min-w-0 truncate text-left">
                                   {String(t.result)} (p={t.probability})
                                 </span>
                                 <span className="w-5">
