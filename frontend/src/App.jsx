@@ -676,9 +676,11 @@ export default function App() {
                     value={
                       summary.performance.classification_cost_multiple != null
                         ? `${summary.performance.classification_cost_multiple}×`
-                        : '—'
+                        : summary.performance.cost_multiple != null
+                          ? `${summary.performance.cost_multiple}×`
+                          : '—'
                     }
-                    sub={`estimated $${summary.performance.total_llm_classification_cost_usd.toFixed(6)} → $${summary.performance.total_jev_cost_usd.toFixed(6)}`}
+                    sub={`estimated $${Number(summary.performance.total_llm_classification_cost_usd ?? summary.performance.total_llm_cost_usd ?? 0).toFixed(6)} → $${Number(summary.performance.total_jev_cost_usd ?? 0).toFixed(6)}`}
                     icon={<DollarSign className="w-4 h-4 text-emerald-600" />}
                     tone="emerald"
                   />
