@@ -46,8 +46,9 @@ class RunLogger:
         total_jev_duration = 0.0
         total_llm_cost = 0.0
         total_jev_cost = 0.0
-        total_llm_input_tokens = 0
+        total_llm_classification_cost = 0.0
         total_jev_input_tokens = 0
+        total_llm_input_tokens = 0
 
         for c in comparisons:
             m = c.get("metrics", {})
@@ -72,16 +73,23 @@ class RunLogger:
             total_jev_duration += perf.get("jev_duration_ms", 0.0)
             total_llm_cost += perf.get("llm_cost_usd") or 0.0
             total_jev_cost += perf.get("jev_cost_usd", 0.0)
+            total_llm_classification_cost += perf.get("llm_classification_cost_usd", 0.0)
             total_llm_input_tokens += perf.get("llm_tokens", {}).get("input", 0)
             total_jev_input_tokens += perf.get("jev_usage", {}).get("input_tokens", 0)
 
         avg_llm_duration = round(total_llm_duration / max(total_articles, 1), 2)
         avg_jev_duration = round(total_jev_duration / max(total_articles, 1), 2)
         speedup = round(avg_llm_duration / max(avg_jev_duration, 1.0), 2) if avg_llm_duration > 0 else 1.0
-
         savings_usd = total_llm_cost - total_jev_cost
         savings_pct = round((savings_usd / max(total_llm_cost, 0.00001)) * 100.0, 1) if total_llm_cost > 0 else 0.0
-        # Express the comparison as a multiple (e.g. "15x cheaper"), not just a percentage.
+        classification_savings_usd = total_llm_classification_cost - total_jev_cost
+        classification_savings_pct = round(
+            classification_savings_usd / max(total_llm_classification_cost, 0.00001) * 100,
+            1,
+        ) if total_llm_classification_cost > 0 else 0.0
+        classification_cost_multiple = round(
+            total_llm_classification_cost / max(total_jev_cost, 0.00000001), 1
+        ) if total_jev_cost > 0 else None
         cost_multiple = round(total_llm_cost / total_jev_cost, 1) if total_jev_cost > 0 else None
 
         def pct(correct: int, total: int) -> float:
@@ -144,15 +152,17 @@ class RunLogger:
                 "avg_jev_duration_ms": avg_jev_duration,
                 "speedup_ratio": speedup,
                 "total_llm_cost_usd": round(total_llm_cost, 6),
+                "total_llm_classification_cost_usd": round(total_llm_classification_cost, 6),
                 "total_jev_cost_usd": round(total_jev_cost, 6),
                 "cost_savings_usd": round(savings_usd, 6),
                 "cost_savings_pct": savings_pct,
                 "cost_multiple": cost_multiple,
+                "classification_cost_savings_pct": classification_savings_pct,
+                "classification_cost_multiple": classification_cost_multiple,
                 "total_llm_input_tokens": total_llm_input_tokens,
                 "total_jev_input_tokens": total_jev_input_tokens
             }
         }
-
         # Save JSON summary
         summary_path = os.path.join(run_folder, "benchmark_summary.json")
         with open(summary_path, "w", encoding="utf-8") as f:
@@ -204,7 +214,8 @@ Comparison of TypeSafe Jev decisions against baseline LLM audit labels:
 
 | Metric | LLM Baseline | TypeSafe Jev | Impact / Delta |
 | :--- | :--- | :--- | :--- |
-| **Total Cost (USD)** | ${perf["total_llm_cost_usd"]:.6f} | ${perf["total_jev_cost_usd"]:.6f} | **{perf["cost_multiple"]}x cheaper (${perf["cost_savings_usd"]:.6f} saved, {perf["cost_savings_pct"]}%)** |
+| **Full pipeline cost (USD)** | ${perf["total_llm_cost_usd"]:.6f} | ${perf["total_jev_cost_usd"]:.6f} | **{perf["cost_multiple"]}x cheaper** |
+| **Classification-only estimated cost (USD)** | ${perf["total_llm_classification_cost_usd"]:.6f} | ${perf["total_jev_cost_usd"]:.6f} | **{perf["classification_cost_multiple"]}x cheaper ({perf["classification_cost_savings_pct"]}% reduction)** |
 | **Total Input Tokens** | {perf["total_llm_input_tokens"]:,} | {perf["total_jev_input_tokens"]:,} | - |
 
 ---

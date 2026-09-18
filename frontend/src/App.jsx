@@ -672,13 +672,13 @@ export default function App() {
                     tone="amber"
                   />
                   <StatCard
-                    label="LLM Cost Multiple"
+                    label="Classification Cost Multiple"
                     value={
-                      summary.performance.cost_multiple != null
-                        ? `${summary.performance.cost_multiple}×`
-                        : `${summary.performance.cost_savings_pct}%`
+                      summary.performance.classification_cost_multiple != null
+                        ? `${summary.performance.classification_cost_multiple}×`
+                        : '—'
                     }
-                    sub={`$${summary.performance.total_llm_cost_usd.toFixed(6)} → $${summary.performance.total_jev_cost_usd.toFixed(6)}`}
+                    sub={`estimated $${summary.performance.total_llm_classification_cost_usd.toFixed(6)} → $${summary.performance.total_jev_cost_usd.toFixed(6)}`}
                     icon={<DollarSign className="w-4 h-4 text-emerald-600" />}
                     tone="emerald"
                   />

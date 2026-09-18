@@ -51,6 +51,66 @@ def estimate_llm_cost_usd(
     return {"cost_usd": cost, "source": "token_estimate"}
 
 
+def estimate_classification_cost_usd(
+    blob_audit: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    subject_comparisons: List[Dict[str, Any]],
+    tag_comparisons: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Estimate LLM cost for only the four structured classification decisions.
+
+    Audit blobs provide aggregate token counts, not field-level attribution. We
+    therefore remove known summary/rejection input text and estimate comparable
+    output tokens from the compact classification-only JSON. The result is labeled
+    estimated and must not replace the full-call billing metric.
+    """
+    import json
+
+    tokens = blob_audit.get("llm_tokens") or {}
+    input_tokens = int(tokens.get("input", 0) or 0)
+    cached_tokens = int(blob_audit.get("llm_cached_tokens", 0) or 0)
+    summary = snapshot.get("summary_prompt") or {}
+    excluded_text = (
+        summary.get("prompt_text", "")
+        + summary.get("rejected_prompt_text", "")
+        + "Summary instructions Rejection reason instructions"
+    )
+    excluded_input_tokens = max(0, round(len(excluded_text) / 4))
+    comparable_input_tokens = max(0, input_tokens - cached_tokens - excluded_input_tokens)
+
+    classification_output = {
+        "validation_result": blob_audit.get("validation_result"),
+        "subjects": [
+            {
+                "subject_id": c["subject_id"],
+                "is_valid": c["validation"]["llm"],
+                "prominence": c["prominence"]["llm"],
+                "sentiment": c["sentiment"]["llm"],
+            }
+            for c in subject_comparisons
+        ],
+        "tags": [
+            {"subject_id": t["subject_id"], "tag_id": t["tag_id"], "result": t["llm_result"]}
+            for t in tag_comparisons
+        ],
+    }
+    comparable_output_tokens = max(
+        0, round(len(json.dumps(classification_output, separators=(",", ":"))) / 4)
+    )
+    cost = (
+        comparable_input_tokens / 1_000_000 * settings.LLM_INPUT_COST_PER_MTOK
+        + comparable_output_tokens / 1_000_000 * settings.LLM_OUTPUT_COST_PER_MTOK
+    )
+    return {
+        "cost_usd": cost,
+        "source": "estimated_classification_only",
+        "input_tokens": comparable_input_tokens,
+        "output_tokens": comparable_output_tokens,
+        "excluded_input_tokens": excluded_input_tokens,
+        "excluded_output_fields": ["summary", "rejection_reason", "reasoning"],
+    }
+
+
 def compare_article_results(
     blob_audit: Dict[str, Any],
     jev_result: Dict[str, Any],
@@ -189,11 +249,18 @@ def compare_article_results(
     llm_output_tokens = int(llm_tokens.get("output", 0) or 0)
     llm_cost_info = estimate_llm_cost_usd(blob_audit, llm_cost_override_usd)
     llm_cost_usd = llm_cost_info["cost_usd"]
+    classification_cost_info = estimate_classification_cost_usd(
+        blob_audit, snapshot, subject_comparisons, tag_comparisons
+    )
 
     jev_duration_ms = jev_result.get("duration_ms", 0.0)
     jev_cost_usd = jev_result.get("cost_usd", 0.0)
-
-    speedup_ratio = round(llm_duration_ms / max(jev_duration_ms, 1.0), 2) if llm_duration_ms > 0 else 1.0
+    classification_cost_usd = classification_cost_info["cost_usd"]
+    classification_cost_multiple = round(classification_cost_usd / max(jev_cost_usd, 0.00000001), 1) if jev_cost_usd > 0 else None
+    classification_savings_pct = round(
+        (classification_cost_usd - jev_cost_usd) / max(classification_cost_usd, 0.00000001) * 100,
+        1,
+    ) if classification_cost_usd > 0 else 0.0
     cost_savings_usd = (llm_cost_usd or 0.0) - jev_cost_usd
     cost_savings_pct = round((cost_savings_usd / max(llm_cost_usd or 0.00001, 0.00001)) * 100.0, 1) if (llm_cost_usd or 0) > 0 else 0.0
 
@@ -227,10 +294,20 @@ def compare_article_results(
             "llm_tokens": llm_tokens,
             "llm_cost_usd": llm_cost_usd,
             "llm_cost_source": llm_cost_info["source"],
+            "llm_classification_cost_usd": classification_cost_usd,
+            "llm_classification_cost_source": classification_cost_info["source"],
+            "llm_classification_tokens": {
+                "input": classification_cost_info["input_tokens"],
+                "output": classification_cost_info["output_tokens"],
+                "excluded_input": classification_cost_info["excluded_input_tokens"],
+            },
             "jev_provider": jev_result.get("provider"),
             "jev_model": jev_result.get("model"),
+            "jev_duration_ms": jev_duration_ms,
             "jev_usage": jev_result.get("usage"),
             "jev_cost_usd": jev_cost_usd,
+            "classification_cost_multiple": classification_cost_multiple,
+            "classification_cost_savings_pct": classification_savings_pct,
             "speedup_ratio": speedup_ratio,
             "cost_savings_usd": cost_savings_usd,
             "cost_savings_pct": cost_savings_pct
