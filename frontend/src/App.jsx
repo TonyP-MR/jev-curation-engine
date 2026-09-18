@@ -672,15 +672,17 @@ export default function App() {
                     tone="amber"
                   />
                   <StatCard
-                    label="Classification Cost Multiple"
+                    label={summary.performance.total_llm_classification_cost_usd != null ? 'Classification Cost Multiple' : 'Full LLM Cost Multiple (legacy run)'}
                     value={
-                      summary.performance.classification_cost_multiple != null
+                      summary.performance.total_llm_classification_cost_usd != null && summary.performance.classification_cost_multiple != null
                         ? `${summary.performance.classification_cost_multiple}×`
                         : summary.performance.cost_multiple != null
                           ? `${summary.performance.cost_multiple}×`
                           : '—'
                     }
-                    sub={`estimated $${Number(summary.performance.total_llm_classification_cost_usd ?? summary.performance.total_llm_cost_usd ?? 0).toFixed(6)} → $${Number(summary.performance.total_jev_cost_usd ?? 0).toFixed(6)}`}
+                    sub={summary.performance.total_llm_classification_cost_usd != null
+                      ? `estimated $${Number(summary.performance.total_llm_classification_cost_usd).toFixed(6)} → $${Number(summary.performance.total_jev_cost_usd ?? 0).toFixed(6)}`
+                      : `full call $${Number(summary.performance.total_llm_cost_usd ?? 0).toFixed(6)} → $${Number(summary.performance.total_jev_cost_usd ?? 0).toFixed(6)}`}
                     icon={<DollarSign className="w-4 h-4 text-emerald-600" />}
                     tone="emerald"
                   />
@@ -700,6 +702,11 @@ export default function App() {
                       {copiedMd ? 'Copied' : 'Copy Markdown'}
                     </button>
                   </div>
+                  {summary.performance.total_llm_classification_cost_usd == null && (
+                    <div className="mt-3 px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-800">
+                      This run predates the like-for-like classification cost calculation. Start a new run to see the estimated classification-only comparison.
+                    </div>
+                  )}
                   {optimizerInfo && (
                     <div className="mt-3 px-3 py-2 rounded-lg bg-violet-50 border border-violet-200 text-xs text-violet-800">
                       Prompt optimizer: {optimizerInfo.model} · {optimizerInfo.cached ? 'cached rubric' : 'compiled this run'} · optimizer cost ${Number(optimizerInfo.cost_usd || 0).toFixed(6)}
