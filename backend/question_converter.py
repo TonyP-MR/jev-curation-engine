@@ -109,7 +109,9 @@ def extract_subject_aliases(s: dict[str, Any]) -> list[str]:
     GENERIC_CATEGORY_WORDS = {
         "cola", "systems", "technologies", "software", "foods", "health", 
         "group", "holdings", "brands", "international", "global", "solutions",
-        "network", "networks", "enterprises", "energy", "capital", "partners"
+        "network", "networks", "enterprises", "energy", "capital", "partners",
+        "mobile", "wireless", "telecom", "communications", "media", "online",
+        "digital", "care", "services", "financial", "management"
     }
     for compound in [name, clean_base]:
         if "-" in compound and not compound.startswith("-"):
@@ -119,7 +121,6 @@ def extract_subject_aliases(s: dict[str, Any]) -> list[str]:
             ]
             for p in parts:
                 aliases.add(p)
-
     # Add canonical informal aliases
     if name.lower() in ("coca-cola", "coca cola"):
         aliases.add("Coke")
@@ -132,10 +133,10 @@ def extract_subject_aliases(s: dict[str, Any]) -> list[str]:
         cand = m.group(1).strip()
         if "misspell" in cand.lower():
             continue
-        if not any(stop in cand.lower() for stop in ["http", "e.g.", "i.e.", "formerly", "including", "such as", "see", "no "]):
+        if not any(stop in cand.lower() for stop in ["http", "e.g.", "i.e.", "formerly", "including", "such as", "see", "no ", "wire"]):
             for sub in cand.split(","):
                 sub = sub.strip()
-                if 2 <= len(sub) <= 25 and not sub.lower().startswith("nyse:") and not sub.lower().startswith("nasdaq:"):
+                if 2 <= len(sub) <= 25 and not sub.lower().startswith("nyse:") and not sub.lower().startswith("nasdaq:") and sub.lower() not in GENERIC_CATEGORY_WORDS:
                     aliases.add(sub)
     for m in re.finditer(r"(?i)(?:referred to (?:in media )?as|known as|often called)\s+[\"\'“]?([A-Za-z0-9\s&/-]{2,35})[\"\'”]?", raw_text):
         cand = m.group(1).strip()
@@ -148,10 +149,13 @@ def extract_subject_aliases(s: dict[str, Any]) -> list[str]:
         if t_name and any(w in t_group for w in ["brand", "group", "subsidiary", "operating unit", name.lower()]):
             aliases.add(t_name)
 
-    stop_words = {"the", "group", "and", "all", "article", "company", "no explanation", "no other text"}
+    stop_words = {
+        "the", "group", "and", "all", "article", "company", "no explanation", "no other text",
+        "wire", "mobile", "wireless", "online", "services", "service", "care"
+    }
     filtered = []
     for a in sorted(aliases, key=lambda x: -len(x)):
-        if a.lower() not in stop_words and len(a) >= 2:
+        if a.lower() not in stop_words and a.lower() not in GENERIC_CATEGORY_WORDS and len(a) >= 2:
             filtered.append(a)
     return filtered
 
