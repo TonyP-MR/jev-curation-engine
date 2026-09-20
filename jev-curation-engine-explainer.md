@@ -25,7 +25,7 @@ The part that genuinely needs free-form generation is the summary, plus explanat
 
 ```mermaid
 flowchart LR
-    A[Article headline and body] --> B[Jev structured decisions]
+    A[Article headline and body] --> B["System 1 Decision Engine<br/>(Laya Azure GPU / TypeSafe Jev)"]
     B --> C{Approved?}
     C -->|No| D[Store classification result]
     C -->|Yes| E[Optional low-cost summary LLM]
@@ -59,34 +59,43 @@ The rules engine then applies configured actions such as:
 
 The audit blob stores both raw and final information. The final comparison should use `subject_results` and final grouped tags, not only the raw model response.
 
-## Why this is a natural Jev workload
+## Why this is a natural System 1 workload (Jev & Laya)
 
-Jev is designed for software-consumed decisions rather than free-form prose. Its primitives map directly to the four decisions that matter here:
+Both **TypeSafe Jev** and **Laya** (fine-tuned ModernBERT-large) are designed for software-consumed structured decisions rather than free-form prose. Their primitives map directly to the four decisions that matter here:
 
-| Curation Engine decision | Jev primitive | Output used by the rig |
+| Curation Engine decision | Typed primitive | Output used by the rig |
 |---|---|---|
-| Subject validation | `noul` | Probability converted to `true` or `false` using a configurable threshold |
-| Subject prominence | `choice` | `primary`, `significant`, or `passing`, plus probabilities and confidence |
-| Subject sentiment | `choice` | `positive`, `negative`, `neutral`, or `balanced`, plus probabilities and confidence |
-| LLM tag | `noul` | Probability converted to `true` or `false` using a configurable threshold |
-| Boolean tag | Local deterministic evaluator | Existing expression result, never sent to Jev |
+| Subject validation | `noul` (Jev) / Sigmoid validation head (Laya) | Probability converted to `true` or `false` using a configurable threshold |
+| Subject prominence | `choice` (Jev) / Softmax prominence head (Laya) | `primary`, `significant`, or `passing`, plus probabilities and confidence |
+| Subject sentiment | `choice` (Jev) / Softmax sentiment head (Laya) | `positive`, `negative`, `neutral`, or `balanced`, plus probabilities and confidence |
+| LLM tag | `noul` (Jev) / Binary classification head (Laya) | Probability converted to `true` or `false` using a configurable threshold |
+| Boolean tag | Local deterministic evaluator | Existing expression result, never sent to Jev or Laya |
 | Summary | Separate generative LLM | Optional, after approval |
 
-The important architectural difference is that Jev does not need to produce JSON-shaped prose that the application later parses. The questions are typed at the point of evaluation.
+The important architectural difference is that neither engine needs to produce JSON-shaped prose that the application later parses. The questions are typed at the point of evaluation.
 
-All subject and tag questions can be sent in one request. Jev reads the state once and evaluates the questions in parallel. The application then composes the result in normal Python code.
+All subject and tag questions can be evaluated against the distilled article state in parallel or via high-throughput multi-task heads. The application then composes the result in normal Python code.
 
 ```mermaid
 flowchart TD
-    S[Article text and metadata] --> Q[Generated question set]
-    Q --> V[Subject validation questions]
-    Q --> P[Prominence choice questions]
-    Q --> T[Sentiment choice questions]
+    S[Article text and metadata] --> Q[Distilled state & question set]
+    Q --> V[Subject validation]
+    Q --> P[Prominence evaluation]
+    Q --> T[Sentiment evaluation]
     Q --> L[LLM tag questions]
-    V --> R[Typed Jev response]
-    P --> R
-    T --> R
-    L --> R
+    
+    subgraph ENG["System 1 Engine Options"]
+        direction TB
+        V --> E_CHOICE{Engine Choice}
+        P --> E_CHOICE
+        T --> E_CHOICE
+        L --> E_CHOICE
+        E_CHOICE -->|Self-Hosted| LAYA["Laya ModernBERT-large<br/>(Azure Tesla T4 GPU)"]
+        E_CHOICE -->|Cloud API| JEV["TypeSafe Jev<br/>(OpenRouter / Direct Cloud)"]
+    end
+    
+    LAYA --> R[Typed Decision Response]
+    JEV --> R
     R --> N[Python thresholding and result mapping]
     N --> X[Boolean evaluator and rules engine]
     X --> O[Final comparison output]
@@ -345,15 +354,22 @@ The rig records the cost source on each result:
 A production comparison should use a provider billing export or a reliable per-call cost field whenever possible.
 
 ## Prototype architecture
-
 ```mermaid
 flowchart LR
     UI[React test rig UI] --> API[FastAPI backend]
     API --> DB[(Azure MySQL<br/>published config snapshots)]
     API --> BLOB[(Azure Blob Storage<br/>processed article audits)]
     API --> CACHE[(Environment cache)]
-    API --> JEV[TypeSafe Jev API]
-    API --> RUNS[(runs/run_id<br/>JSON and Markdown reports)]
+    
+    subgraph ENGINES["System 1 Engines"]
+        API --> LAYA["Laya: Azure GPU VM<br/>(dev-002: ModernBERT 421M)"]
+        API --> JEV["TypeSafe Jev API<br/>(Cloud Non-Autoregressive)"]
+    end
+    
+    LAYA --> RUNS[(runs/run_id<br/>JSON and Markdown reports)]
+    JEV --> RUNS
+    API --> ARB["Gemini 3.8 Flash<br/>(Discrepancy Arbitration)"]
+    ARB --> RUNS
 ```
 
 The current prototype has these components:
@@ -412,7 +428,7 @@ A possible split is:
 ```mermaid
 flowchart TD
     A[Inbound article] --> B[Config snapshot]
-    B --> C[Jev: validation, prominence, sentiment, LLM tags]
+    B --> C["System 1 Decision Engine<br/>(Laya Azure GPU or TypeSafe Jev)"]
     C --> D[Boolean tags in Python]
     D --> E[Existing rules engine]
     E --> F{Approved?}
@@ -420,7 +436,6 @@ flowchart TD
     F -->|Yes| H[Cheap summary model]
     H --> I[Approved result plus summary]
 ```
-
 This could reduce the number of expensive generative calls. It would not remove the need for ordinary application code or for a generative model if the business still requires a natural-language summary.
 
 ## Risks and open questions

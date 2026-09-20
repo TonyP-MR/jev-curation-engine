@@ -1,8 +1,8 @@
 # jev-curation-engine
 
-A small, read-only feasibility test rig for comparing TypeSafe Jev with the Curation Engine's existing LLM classification results.
+A read-only feasibility test rig for benchmarking System 1 non-autoregressive decision models—**TypeSafe Jev** (Cloud API) and **Laya** (Self-Hosted ModernBERT on Azure GPU)—against the Curation Engine's existing production LLM classification results.
 
-The prototype reads published Curation Engine configuration snapshots from Azure MySQL, discovers processed articles through `pipeline_audit_log`, fetches exact audit blobs from Azure Blob Storage, evaluates the structured classification decisions with Jev, and records side-by-side benchmark results.
+The platform reads published Curation Engine configuration snapshots from Azure MySQL, discovers processed articles through `pipeline_audit_log`, fetches exact audit blobs from Azure Blob Storage, evaluates structured classification decisions across the chosen engine (Laya or Jev), and records side-by-side benchmark, cost, and latency comparisons.
 
 ## What it measures
 
@@ -77,16 +77,34 @@ ENVIRONMENT=staging
 Use `ENVIRONMENT=production` only with approved read-only production credentials and network access. The UI shows the active environment in the header.
 
 ## Data flow
-
 ```mermaid
-flowchart LR
-    UI[React dashboard] --> API[FastAPI backend]
-    API --> SQL[(pipeline_audit_log)]
-    SQL --> IDs[Processed correlation IDs]
-    UI -->|Select or preview| API
-    API --> BLOB[(Exact Azure audit blob)]
-    API --> JEV[TypeSafe Jev API]
-    API --> RUNS[runs/run_id]
+flowchart TD
+    UI[React Dashboard] --> API[FastAPI Backend]
+    API --> SQL[(Azure MySQL<br/>pipeline_audit_log)]
+    SQL --> IDs[Processed Correlation IDs]
+    UI -->|Select Articles or Batch Configs| API
+    API --> BLOB[(Azure Blob Storage<br/>Audit Blobs)]
+    
+    subgraph S1["System 1 Decision Engine Choice"]
+        direction TB
+        ENGINE{Decision Engine Selector}
+        LAYA["Laya: Azure Tesla T4 GPU<br/>(Self-Hosted ModernBERT-large 421M)"]
+        JEV["TypeSafe Jev: Cloud API<br/>(OpenRouter / Direct Cloud)"]
+        ENGINE -->|Default / Self-Hosted| LAYA
+        ENGINE -->|Cloud API| JEV
+    end
+
+    API --> ENGINE
+    LAYA --> COMP[Side-by-Side Comparator]
+    JEV --> COMP
+    BLOB --> COMP
+    COMP --> RUNS[(runs/run_id<br/>JSON & Markdown)]
+    RUNS --> UI
+    
+    subgraph ARB["Error Arbitration (Gemini 3.8)"]
+        UI -->|Analyse Errors| ARB_RUN[Discrepancy Auditor]
+        ARB_RUN --> SYNTH[Executive Synthesis & Ruling]
+    end
 ```
 
 The article picker uses `pipeline_audit_log` as the index. It does not scan the Blob container. It constructs the normal blob name from the correlation ID:
@@ -140,8 +158,7 @@ From the **Dashboard** for any completed run:
 
 1. Click **Analyse Errors** in the Business summary header.
 2. Gemini 3.8 audits discrepancies across subject validation, prominence, sentiment, and LLM tags against source article text.
-3. The system generates an **Executive Synthesis** detailing winning models, pattern root causes (e.g. baseline hallucination vs Jev strict text grounding), and actionable tuning recommendations.
-3. The system generates an **Executive Synthesis** detailing winning models, pattern root causes (e.g. baseline hallucination vs Jev strict text grounding), and actionable tuning recommendations.
+3. The system generates an **Executive Synthesis** detailing winning models, pattern root causes (e.g. baseline hallucination vs Laya/Jev strict text grounding), and actionable tuning recommendations.
 4. Inspect individual article rulings and field-by-field verdicts in the detail modal, with quick-filter chips for `[Laya Wins]`, `[LLM Wins]`, `[Prominence]`, `[Sentiment]`, and `[Tags]`.
 
 ---
