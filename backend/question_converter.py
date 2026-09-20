@@ -336,7 +336,31 @@ def convert_config_to_jev_questions(
             if t.get("evaluation_type") == "llm" and t.get("prompt_text"):
                 t_id = t["tag_id"]
                 t_name = t.get("tag_name") or t_id
-                t_criteria = sanitize_heading(optimized_tags.get(str(t_id)) or t.get("prompt_text") or "")
+                raw_criteria = sanitize_heading(optimized_tags.get(str(t_id)) or t.get("prompt_text") or "")
+                t_lower = t_name.lower()
+                
+                # Negative guardrail injection for known confusion categories
+                extra_guardrails = ""
+                if any(w in t_lower for w in ["partnership", "partner", "alliance", "joint venture"]):
+                    extra_guardrails = (
+                        " Explicit negative exclusion: Standard third-party software compatibility, app store listings, "
+                        "operating system integrations, APIs, generic client reviews, and multi-vendor list roundups DO NOT qualify "
+                        "as a partnership. A partnership requires an explicit, announced mutual corporate or technology agreement."
+                    )
+                elif any(w in t_lower for w in ["developer", "devops", "engineering"]):
+                    extra_guardrails = (
+                        " Explicit negative exclusion: General consumer how-to guides, personal password tips, and general security "
+                        "tutorials aimed at everyday end-users DO NOT qualify as Developer content. The content must specifically "
+                        "target software engineers, developer tooling, SDKs, or programming workflows."
+                    )
+                elif t_lower == "ai" or "artificial intelligence" in t_lower:
+                    extra_guardrails = (
+                        " Explicit negative exclusion: Passing biographical mentions in author blurbs, routine automation, "
+                        "or generic software algorithms DO NOT qualify. The content must substantively discuss artificial intelligence "
+                        "or machine learning directly related to the subject."
+                    )
+
+                t_criteria = (raw_criteria + extra_guardrails).strip()
                 
                 questions[f"tag_{s_id}_{t_id}"] = {
                     "type": "noul",

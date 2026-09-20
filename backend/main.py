@@ -481,31 +481,37 @@ async def execute_benchmark_task(
                                 p_ans = answers_map[prom_key]
                                 current_choice = p_ans.get("choice")
                                 
+                                # Strict single/zero mention ceiling: An entity with <= 1 mention outside the headline is strictly passing
+                                if not in_hl and mention_count <= 1:
+                                    p_ans["choice"] = "passing"
+                                    p_ans["confidence"] = 0.95
                                 # Relative share constraint: An entity with far fewer mentions than the dominant entity cannot be primary
-                                if max_mentions_in_article >= 5 and mention_count <= 2 and not in_hl and current_choice == "primary":
-                                    p_ans["choice"] = "significant" if mention_count >= 2 else "passing"
+                                elif max_mentions_in_article >= 5 and mention_count <= 2 and not in_hl:
+                                    p_ans["choice"] = "passing"
                                     p_ans["confidence"] = 0.90
                                 # Ceiling constraint: Multi-company list or brief citation cannot be primary
-                                in_list_context = any(
-                                    bool(
-                                        re.search(r'(?:,\s*|\band\s+)' + re.escape(a) + r'(?:,\s*|\band\s+|\s*\))', full_text, re.IGNORECASE)
-                                        or re.search(r'\(\s*(?:[^)]*,\s*)?' + re.escape(a) + r'(?:,\s*[^)]*)?\)', full_text, re.IGNORECASE)
+                                else:
+                                    in_list_context = any(
+                                        bool(
+                                            re.search(r'(?:,\s*|\band\s+)' + re.escape(a) + r'(?:,\s*|\band\s+|\s*\))', full_text, re.IGNORECASE)
+                                            or re.search(r'\(\s*(?:[^)]*,\s*)?' + re.escape(a) + r'(?:,\s*[^)]*)?\)', full_text, re.IGNORECASE)
+                                        )
+                                        for a in extract_subject_aliases(s)
                                     )
-                                    for a in extract_subject_aliases(s)
-                                )
-                                if (in_list_context or mention_count < 3) and not in_hl and current_choice == "primary":
-                                    p_ans["choice"] = "significant" if mention_count >= 2 else "passing"
-                                    p_ans["confidence"] = 0.85
-                                # Floor constraint: An entity with >= 4 mentions cannot be passing
-                                elif mention_count >= 4 and current_choice == "passing":
-                                    p_ans["choice"] = "significant" if mention_count < 8 else "primary"
-                                    p_ans["confidence"] = 0.90
-                                elif in_hl and current_choice == "passing":
-                                    p_ans["choice"] = "primary" if len(hl_entities) <= 1 else "significant"
-                                    p_ans["confidence"] = 0.95
-                                elif in_lead and current_choice == "passing" and mention_count >= 2:
-                                    p_ans["choice"] = "significant"
-                                    p_ans["confidence"] = 0.90
+                                    if (in_list_context or mention_count < 3) and not in_hl:
+                                        if current_choice == "primary":
+                                            p_ans["choice"] = "significant" if mention_count >= 2 else "passing"
+                                            p_ans["confidence"] = 0.85
+                                    # Floor constraint: An entity with >= 4 mentions cannot be passing
+                                    elif mention_count >= 4 and current_choice == "passing":
+                                        p_ans["choice"] = "significant" if mention_count < 8 else "primary"
+                                        p_ans["confidence"] = 0.90
+                                    elif in_hl and current_choice == "passing":
+                                        p_ans["choice"] = "primary" if len(hl_entities) <= 1 else "significant"
+                                        p_ans["confidence"] = 0.95
+                                    elif in_lead and current_choice == "passing" and mention_count >= 2:
+                                        p_ans["choice"] = "significant"
+                                        p_ans["confidence"] = 0.90
                             # Recalibrate Sentiment: Neutral baseline for routine business / sports
                             if is_valid and sent_key in answers_map:
                                 s_ans = answers_map[sent_key]
