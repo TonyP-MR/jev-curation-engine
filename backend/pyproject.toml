@@ -8,9 +8,18 @@ dependencies = [
     "azure-storage-blob>=12.30.2",
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
+    "laya>=0.3.4",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
     "pymysql>=1.2.3",
     "python-dotenv>=1.2.3",
+    "torch>=2.14.0",
+    "transformers>=5.17.0",
     "uvicorn>=0.53.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+    "ruff>=0.16.8",
 ]

@@ -19,6 +19,7 @@ _MANAGED_KEYS = [
     "GEMINI_API_KEY", "GEMINI_OPTIMIZER_MODEL", "PROMPT_OPTIMIZATION_ENABLED",
     "LLM_INPUT_COST_PER_MTOK", "LLM_OUTPUT_COST_PER_MTOK",
     "LLM_FLAT_COST_PER_ARTICLE_USD",
+    "LAYA_MODEL", "LAYA_DEVICE", "LAYA_REMOTE_URL", "LAYA_API_KEY",
 ]
 
 
@@ -98,9 +99,14 @@ class Settings(BaseSettings):
     GEMINI_OPTIMIZER_MODEL: str = "gemini-2.5-flash"
     PROMPT_OPTIMIZATION_ENABLED: bool = False
     TYPESAFE_COST_PER_MILLION_INPUT_TOKENS: float = 0.042
-    # Number of parallel requests sent during benchmark execution (default: 5)
+    LAYA_MODEL: str = "laya:azure:t4"
+    LAYA_DEVICE: str = "mps"
+    LAYA_REMOTE_URL: str = "http://20.90.113.57:8000/api/alpha/decisions"
+    LAYA_API_KEY: str = "laya_sec_8bc85b1d61947e71783c7ad23a65f14534558bf4127af230"
     BENCHMARK_CONCURRENCY: int = 5
-
+    LAYA_BENCHMARK_CONCURRENCY: int = 8
+    VALIDATION_THRESHOLD: float = 0.45
+    TAG_THRESHOLD: float = 0.55
     # --- Baseline LLM pricing (used when the blob has no recorded cost) ---
     # Audit blobs write llm_cost_usd = null, so the rig estimates from llm_tokens.
     # Google Gemini 2.5 Flash list pricing:

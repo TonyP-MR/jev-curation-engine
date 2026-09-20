@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import time
-from typing import Any, Dict
+from typing import Any
 
 import httpx
 
@@ -22,7 +22,7 @@ class PromptOptimizer:
         self.cache_dir = os.path.join(settings.CACHE_DIR, "optimized_prompts")
         os.makedirs(self.cache_dir, exist_ok=True)
 
-    def _cache_key(self, snapshot: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+    def _cache_key(self, snapshot: dict[str, Any], metadata: dict[str, Any]) -> str:
         source = {
             "optimizer_version": OPTIMIZER_VERSION,
             "model": settings.GEMINI_OPTIMIZER_MODEL,
@@ -35,9 +35,9 @@ class PromptOptimizer:
 
     async def optimize_snapshot(
         self,
-        snapshot: Dict[str, Any],
-        metadata: Dict[str, Any],
-    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        snapshot: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         if not settings.GEMINI_API_KEY:
             raise PromptOptimizationError(
                 "Prompt optimization is enabled but GEMINI_API_KEY is not configured"
@@ -85,7 +85,7 @@ class PromptOptimizer:
         return rubric, optimizer_metadata
 
     @staticmethod
-    def _source_config(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    def _source_config(snapshot: dict[str, Any]) -> dict[str, Any]:
         subjects = []
         for subject in snapshot.get("subjects", []):
             subjects.append(
@@ -111,7 +111,7 @@ class PromptOptimizer:
         return {"subjects": subjects}
 
     @staticmethod
-    def _build_optimizer_prompt(source: Dict[str, Any]) -> str:
+    def _build_optimizer_prompt(source: dict[str, Any]) -> str:
         source_json = json.dumps(source, ensure_ascii=False, indent=2)
         return f"""You are a conservative configuration compiler. Compact the supplied Curation Engine classification rules for a typed decision model.
 
@@ -141,7 +141,7 @@ SOURCE CONFIGURATION:
 {source_json}
 """
 
-    async def _call_gemini(self, prompt: str) -> Dict[str, Any]:
+    async def _call_gemini(self, prompt: str) -> dict[str, Any]:
         url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
             f"{settings.GEMINI_OPTIMIZER_MODEL}:generateContent"
@@ -173,7 +173,7 @@ SOURCE CONFIGURATION:
         }
 
     @staticmethod
-    def _parse_json_response(text: str) -> Dict[str, Any]:
+    def _parse_json_response(text: str) -> dict[str, Any]:
         try:
             value = json.loads(text)
         except json.JSONDecodeError as exc:
@@ -183,7 +183,7 @@ SOURCE CONFIGURATION:
         return value
 
     @staticmethod
-    def _validate_rubric(rubric: Dict[str, Any], snapshot: Dict[str, Any]) -> None:
+    def _validate_rubric(rubric: dict[str, Any], snapshot: dict[str, Any]) -> None:
         if not isinstance(rubric.get("subjects"), list):
             raise PromptOptimizationError("Optimized rubric has no subjects list")
         expected = {str(s["id"]): s for s in snapshot.get("subjects", [])}
@@ -208,6 +208,74 @@ SOURCE CONFIGURATION:
                 raise PromptOptimizationError(f"Optimized rubric changed LLM tags for {subject_id}")
             if any(not isinstance(t.get("criteria"), str) or not t["criteria"].strip() for t in actual_tags.values()):
                 raise PromptOptimizationError(f"Optimized rubric contains an empty tag criterion for {subject_id}")
-
-
 prompt_optimizer = PromptOptimizer()
+
+
+def compile_system_one_rubric(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Deterministically compiles verbose Curation Engine prompts into high-density,
+    bounded criteria rubrics optimized for ModernBERT System 1 decision models.
+    Extracts product/leadership aliases and eliminates output-format boilerplate so
+    no criteria exceed the encoder head token budget.
+    """
+    import re
+
+    compiled_subjects = []
+    for s in snapshot.get("subjects", []):
+        s_id = str(s["id"])
+        name = s.get("name", "")
+        raw_text = " ".join([
+            s.get("entity_definition", "") or "",
+            s.get("validation_prompt", "") or "",
+            s.get("prominence_prompt", "") or "",
+        ])
+
+        # Extract named products and aliases from parentheses
+        aliases = []
+        for m in re.finditer(r"\(([^)]{3,100})\)", raw_text):
+            cand = m.group(1)
+            if any(w in cand.lower() for w in ["product", "platform", "including", "service", "leadership", "e.g.", "brands"]) or "," in cand:
+                parts = [p.strip() for p in cand.replace("e.g.", "").split(",") if len(p.strip()) > 2]
+                aliases.extend(parts)
+
+        # Unique aliases
+        seen = set()
+        unique_aliases = []
+        for a in aliases:
+            a_clean = a.strip()
+            if a_clean.lower() not in seen and len(a_clean) < 40:
+                seen.add(a_clean.lower())
+                unique_aliases.append(a_clean)
+
+        alias_summary = ", ".join(unique_aliases[:8])
+        val_rule = (
+            f"Relevant to {name} operations"
+            + (f" or products ({alias_summary})" if alias_summary else "")
+            + ". Excludes incidental partner lists, sponsored ads, or unrelated homonyms."
+        )
+        prom_rule = (
+            "Primary: Dominant story focus in headline/lead. "
+            "Significant: Key topic discussed substantively across multiple paragraphs. "
+            "Passing: Brief citation, quote, or list entry."
+        )
+        sent_rule = (
+            f"Tone toward {name}. Default is factual neutral. "
+            f"Positive: business growth, award, innovation, revenue beat. "
+            f"Negative: regulatory scrutiny, litigation, scandal, financial loss, breach."
+        )
+
+        tags = []
+        for t in s.get("tag_evaluations", []):
+            if t.get("evaluation_type") == "llm" and t.get("prompt_text"):
+                clean_t = re.sub(r"^(Respond|Return|Classify|Determine).*?\.\s*", "", t["prompt_text"]).strip()
+                tags.append({"tag_id": str(t["tag_id"]), "criteria": clean_t[:400]})
+
+        compiled_subjects.append({
+            "subject_id": s_id,
+            "name": name,
+            "aliases": unique_aliases[:10],
+            "validation_criteria": val_rule,
+            "prominence_criteria": prom_rule,
+            "sentiment_criteria": sent_rule,
+            "tags": tags,
+        })
+    return {"subjects": compiled_subjects}

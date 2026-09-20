@@ -117,12 +117,15 @@ def compare_article_results(
     snapshot: Dict[str, Any],
     noul_threshold: float = 0.50,
     llm_cost_override_usd: Optional[float] = None,
+    validation_threshold: Optional[float] = None,
+    tag_threshold: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Compare LLM audit ground truth against TypeSafe Jev answers for elements 1-4:
     subject validation, prominence, sentiment, and LLM tags.
     """
     answers = jev_result.get("answers", {})
     subject_results = blob_audit.get("subject_results", [])
+    jev_valid_by_subject: Dict[str, bool] = {}
     
     # Map blob subject results by subject_id
     llm_subjects: Dict[str, Dict[str, Any]] = {}
@@ -151,27 +154,33 @@ def compare_article_results(
         llm_is_valid = bool(llm_sub.get("is_valid", False))
         jev_val_ans = answers.get(f"subj_{s_id}_valid", {})
         jev_val_prob = jev_val_ans.get("noul", 0.0) if jev_val_ans.get("type") == "noul" else 0.0
-        jev_is_valid = jev_val_prob >= noul_threshold
+        val_thresh = validation_threshold if validation_threshold is not None else getattr(settings, "VALIDATION_THRESHOLD", 0.45)
+        jev_is_valid = jev_val_prob >= val_thresh
+        jev_valid_by_subject[s_id] = jev_is_valid
         val_match = (llm_is_valid == jev_is_valid)
         val_total += 1
         if val_match:
             val_correct += 1
 
         # 2. Prominence comparison
+        # Curation Engine pipeline rule: An invalid article for an entity defaults to passing prominence
         llm_prom = str(llm_sub.get("prominence", "")).lower()
         jev_prom_ans = answers.get(f"subj_{s_id}_prominence", {})
-        jev_prom = str(jev_prom_ans.get("choice", "")).lower()
-        jev_prom_conf = jev_prom_ans.get("confidence", 0.0)
+        jev_prom_raw = str(jev_prom_ans.get("choice", "")).lower()
+        jev_prom = jev_prom_raw if jev_is_valid else "passing"
+        jev_prom_conf = jev_prom_ans.get("confidence", 0.0) if jev_is_valid else 1.0
         prom_match = (llm_prom == jev_prom)
         prom_total += 1
         if prom_match:
             prom_correct += 1
 
         # 3. Sentiment comparison
+        # Curation Engine pipeline rule: An invalid article for an entity defaults to neutral sentiment
         llm_sent = str(llm_sub.get("sentiment", "")).lower()
         jev_sent_ans = answers.get(f"subj_{s_id}_sentiment", {})
-        jev_sent = str(jev_sent_ans.get("choice", "")).lower()
-        jev_sent_conf = jev_sent_ans.get("confidence", 0.0)
+        jev_sent_raw = str(jev_sent_ans.get("choice", "")).lower()
+        jev_sent = jev_sent_raw if jev_is_valid else "neutral"
+        jev_sent_conf = jev_sent_ans.get("confidence", 0.0) if jev_is_valid else 1.0
         sent_match = (llm_sent == jev_sent)
         sent_total += 1
         if sent_match:
@@ -223,11 +232,13 @@ def compare_article_results(
                 if q_key in answers:
                     jev_tag_ans = answers[q_key]
                     jev_tag_prob = jev_tag_ans.get("noul", 0.0)
-                    jev_tag_res = jev_tag_prob >= noul_threshold
+                    tag_thresh = tag_threshold if tag_threshold is not None else getattr(settings, "TAG_THRESHOLD", 0.55)
+                    jev_tag_raw = jev_tag_prob >= tag_thresh
+                    subject_is_valid = jev_valid_by_subject.get(s_id, False)
+                    jev_tag_res = jev_tag_raw if subject_is_valid else False
                     
                     llm_tag_res = blob_llm_tags.get(t_id, False)
                     tag_match = (llm_tag_res == jev_tag_res)
-                    tag_total += 1
                     if tag_match:
                         tag_correct += 1
 

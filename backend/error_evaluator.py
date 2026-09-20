@@ -77,38 +77,50 @@ class ErrorEvaluator:
                     s_name = s.get("name")
                     for cat in ["validation", "prominence", "sentiment"]:
                         cat_data = s.get(cat, {})
-                        if not cat_data.get("match"):
+                        llm_val = cat_data.get("llm")
+                        jev_val = cat_data.get("jev")
+                        # Skip null artifacts where neither model produced a decision
+                        if llm_val is None and jev_val is None:
+                            continue
+                        if not cat_data.get("match") and (llm_val != jev_val):
                             subject_mismatches.append({
                                 "subject": s_name,
                                 "dimension": cat,
-                                "llm": cat_data.get("llm"),
-                                "jev": cat_data.get("jev"),
+                                "llm": llm_val,
+                                "jev": jev_val,
                             })
 
                 tag_mismatches = []
                 for t in r.get("tag_comparisons", []):
-                    if not t.get("match"):
+                    llm_val = t.get("llm_result") if "llm_result" in t else t.get("llm")
+                    jev_val = t.get("jev_result") if "jev_result" in t else t.get("jev")
+                    if llm_val is None and jev_val is None:
+                        continue
+                    if not t.get("match") and (llm_val != jev_val):
                         tag_mismatches.append({
-                            "tag": t.get("name"),
-                            "llm": t.get("llm"),
-                            "jev": t.get("jev"),
+                            "tag": t.get("tag_name") or t.get("name"),
+                            "llm": llm_val,
+                            "jev": jev_val,
                         })
 
-                issues.append({
-                    "type": "disagreement",
-                    "correlation_id": r.get("correlation_id"),
-                    "headline": r.get("headline", "Untitled"),
-                    "config_id": r.get("config_id"),
-                    "subject_mismatches": subject_mismatches,
-                    "tag_mismatches": tag_mismatches,
-                    "record": r,
-                })
+                # Telemetry hygiene: Filter out records with null payloads or no genuine disagreement
+                if subject_mismatches or tag_mismatches:
+                    issues.append({
+                        "type": "disagreement",
+                        "correlation_id": r.get("correlation_id"),
+                        "headline": r.get("headline", "Untitled"),
+                        "config_id": r.get("config_id"),
+                        "subject_mismatches": subject_mismatches,
+                        "tag_mismatches": tag_mismatches,
+                        "record": r,
+                    })
         return issues
 
     async def evaluate_article_discrepancy(
         self,
         issue: Dict[str, Any],
         article_state_preview: str,
+        candidate_label: str = "TypeSafe Jev",
     ) -> Dict[str, Any]:
         """Ask Gemini to arbitrate which model is correct for a specific article disagreement."""
         headline = issue.get("headline")
@@ -117,8 +129,7 @@ class ErrorEvaluator:
 
         prompt = f"""You are an expert editorial auditor comparing two automated classification systems:
 1. Baseline LLM
-2. TypeSafe Jev (a calibrated classification model)
-
+2. {candidate_label} (a calibrated System 1 decision model)
 ARTICLE HEADLINE: {headline}
 ARTICLE TEXT (or excerpt):
 \"\"\"
@@ -178,6 +189,21 @@ Return ONLY a valid JSON object matching this schema:
         started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ")
         issues = self.find_discrepancies(records)
 
+        candidate_raw = ""
+        if records:
+            perf = records[0].get("performance") or {}
+            candidate_raw = perf.get("jev_model") or ""
+        clean_candidate = str(candidate_raw).lower()
+        if "azure" in clean_candidate:
+            candidate_label = "Laya (Azure T4 GPU)"
+        elif "finetuned" in clean_candidate or "fine-tuned" in clean_candidate:
+            candidate_label = "Laya (Fine-Tuned)"
+        elif "laya" in clean_candidate:
+            candidate_label = "Laya (Azure T4 GPU)"
+        elif candidate_raw:
+            candidate_label = candidate_raw
+        else:
+            candidate_label = "TypeSafe Jev"
         if not issues:
             return {
                 "run_id": run_id,
@@ -213,14 +239,15 @@ Return ONLY a valid JSON object matching this schema:
                     logger.warning(f"Could not load article text for {corr_id}: {ex}")
 
             if not article_text:
-                article_text = (
-                    issue.get("record", {}).get("jev_request", {}).get("state")
-                    or issue.get("headline", "")
-                )
+                rec = issue.get("record") or {}
+                jev_req = rec.get("jev_request") or {}
+                article_text = jev_req.get("state") or issue.get("headline", "")
 
             async with sem:
                 try:
-                    eval_res = await self.evaluate_article_discrepancy(issue, article_text)
+                    eval_res = await self.evaluate_article_discrepancy(
+                        issue, article_text, candidate_label=candidate_label
+                    )
                     return {
                         "correlation_id": corr_id,
                         "headline": issue.get("headline"),
@@ -240,17 +267,17 @@ Return ONLY a valid JSON object matching this schema:
         eval_results = await asyncio.gather(*[arbitrate_single(issue) for issue in eval_sample])
         article_evaluations = list(eval_results)
 
-        llm_preferred = sum(1 for a in article_evaluations if a.get("arbitration", {}).get("overall_preferred_model") == "llm")
-        jev_preferred = sum(1 for a in article_evaluations if a.get("arbitration", {}).get("overall_preferred_model") == "jev")
-        ties = sum(1 for a in article_evaluations if a.get("arbitration") and a.get("arbitration", {}).get("overall_preferred_model") not in ("llm", "jev"))
+        llm_preferred = sum(1 for a in article_evaluations if (a.get("arbitration") or {}).get("overall_preferred_model") == "llm")
+        jev_preferred = sum(1 for a in article_evaluations if (a.get("arbitration") or {}).get("overall_preferred_model") == "jev")
+        ties = sum(1 for a in article_evaluations if a.get("arbitration") and (a.get("arbitration") or {}).get("overall_preferred_model") not in ("llm", "jev"))
 
         # Synthesize executive summary report across evaluations
         exec_prompt = f"""You are an executive auditor reviewing a model comparison report.
-Based on the following disagreement arbitration findings between the baseline LLM and TypeSafe Jev (evaluated using {self.model}):
+Based on the following disagreement arbitration findings between the Baseline LLM and {candidate_label} (evaluated using {self.model}):
 
 Total discrepancies found: {len(disagreements)}
 Sample analyzed in detail: {len(article_evaluations)}
-TypeSafe Jev preferred in: {jev_preferred} articles
+{candidate_label} preferred in: {jev_preferred} articles
 Baseline LLM preferred in: {llm_preferred} articles
 Ties / both defensible in: {ties} articles
 Execution/gateway failures: {len(failures)}
@@ -261,7 +288,7 @@ SAMPLE ARTICLE ARBITRATIONS:
 Generate a clean, high-impact markdown summary:
 1. Executive Verdict: Which model was more accurate overall and where each model excels.
 2. Root Causes of Discrepancies: Key patterns (e.g. sentiment calibration, threshold sensitivity on passing mentions, hallucination vs precision).
-3. Recommendation: Actionable guidance on whether Jev is production-ready or which thresholds/prompts should be tuned.
+3. Recommendation: Actionable guidance on whether {candidate_label} is production-ready or which thresholds/prompts should be tuned.
 Do not use marketing fluff. Stick strictly to concrete observations.
 """
         try:
@@ -273,6 +300,7 @@ Do not use marketing fluff. Stick strictly to concrete observations.
 
         return {
             "run_id": run_id,
+            "candidate_model": candidate_label,
             "model": self.model,
             "analyzed_at": started_at,
             "total_issues": len(issues),

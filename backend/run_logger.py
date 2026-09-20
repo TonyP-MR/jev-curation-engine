@@ -133,6 +133,8 @@ class RunLogger:
                 / optimizer_summary["original_question_chars"] * 100,
                 1,
             )
+        cand_model = comparisons[0].get("performance", {}).get("jev_model") if comparisons else None
+        cand_provider = comparisons[0].get("performance", {}).get("jev_provider") if comparisons else None
 
         summary = {
             "run_id": run_id,
@@ -162,6 +164,8 @@ class RunLogger:
             },
             "prompt_optimization": optimizer_summary,
             "performance": {
+                "jev_model": cand_model,
+                "jev_provider": cand_provider,
                 "avg_llm_duration_ms": avg_llm_duration,
                 "avg_jev_duration_ms": avg_jev_duration,
                 "speedup_ratio": speedup,
@@ -203,8 +207,16 @@ class RunLogger:
     def _generate_markdown_report(self, s: Dict[str, Any]) -> str:
         acc = s["accuracy"]
         perf = s["performance"]
-        return f"""# TypeSafe Jev vs LLM Feasibility Benchmark Report
-
+        cand_raw = str(perf.get("jev_model") or "TypeSafe Jev")
+        if "azure" in cand_raw.lower():
+            cand_name = "Laya (Azure T4 GPU)"
+        elif "finetuned" in cand_raw.lower() or "fine-tuned" in cand_raw.lower():
+            cand_name = "Laya (Fine-Tuned)"
+        elif "laya" in cand_raw.lower():
+            cand_name = "Laya (Azure T4 GPU)"
+        else:
+            cand_name = cand_raw or "TypeSafe Jev"
+        return f"""# {cand_name} vs LLM Feasibility Benchmark Report
 **Run ID:** `{s["run_id"]}`  
 **Evaluated Articles:** {s["total_articles"]}  
 **Completed:** {s["completed_at"]}  
@@ -213,7 +225,7 @@ class RunLogger:
 
 ## 1. Classification Parity & Accuracy
 
-Comparison of TypeSafe Jev decisions against baseline LLM audit labels:
+Comparison of {cand_name} decisions against baseline LLM audit labels:
 
 | Decision Task | Accuracy (%) | Matches / Total |
 | :--- | :--- | :--- |
@@ -226,7 +238,7 @@ Comparison of TypeSafe Jev decisions against baseline LLM audit labels:
 
 ## 2. Speed and Cost Comparison
 
-| Metric | LLM Baseline | TypeSafe Jev | Impact / Delta |
+| Metric | LLM Baseline | {cand_name} | Impact / Delta |
 | :--- | :--- | :--- | :--- |
 | **Full pipeline cost (USD)** | ${perf["total_llm_cost_usd"]:.6f} | ${perf["total_jev_cost_usd"]:.6f} | **{perf["cost_multiple"]}x cheaper** |
 | **Classification-only estimated cost (USD)** | ${perf["total_llm_classification_cost_usd"]:.6f} | ${perf["total_jev_cost_usd"]:.6f} | **{perf["classification_cost_multiple"]}x cheaper ({perf["classification_cost_savings_pct"]}% reduction)** |
@@ -236,8 +248,8 @@ Comparison of TypeSafe Jev decisions against baseline LLM audit labels:
 
 ## 3. Executive Summary for Downstream LLM & Business
 
-- **Parity Assessment**: TypeSafe Jev evaluates structured classification directly without prompt chain parsing.
-- **Cost Reduction**: Jev charges $0.042 per million input tokens with zero charge for output tokens. Baseline LLM spend is **{perf["cost_multiple"]}x higher** ({perf["cost_savings_pct"]}% cost reduction).
+- **Parity Assessment**: {cand_name} evaluates structured classification directly without prompt chain parsing.
+- **Cost Reduction**: {cand_name} baseline LLM spend is **{perf["cost_multiple"]}x higher** ({perf["cost_savings_pct"]}% cost reduction).
 - **Latency Gain**: Parallel question evaluation achieved an average response time of **{perf["avg_jev_duration_ms"]} ms**, representing a **{perf["speedup_ratio"]}x** speedup over the pipeline LLM.
 """
 
@@ -250,6 +262,8 @@ Comparison of TypeSafe Jev decisions against baseline LLM audit labels:
             if os.path.isdir(r_dir):
                 summary_file = os.path.join(r_dir, "benchmark_summary.json")
                 meta_file = os.path.join(r_dir, "run_meta.json")
+                if not os.path.exists(meta_file) and not os.path.exists(summary_file):
+                    continue
                 run_data = {"run_id": name}
                 if os.path.exists(meta_file):
                     try:

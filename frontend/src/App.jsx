@@ -281,6 +281,9 @@ export default function App() {
   const [analysisError, setAnalysisError] = useState(null);
   const [analysisModalOpen, setAnalysisModalOpen] = useState(false);
   const [errorSampleSize, setErrorSampleSize] = useState(15);
+  const [errorFilter, setErrorFilter] = useState('all');
+  const [selectedModel, setSelectedModel] = useState('laya:azure:t4');
+  const [providersData, setProvidersData] = useState(null);
   const configCounts = useMemo(() => {
     const m = {};
     for (const c of blobConfigs) m[c.config_id] = c.count;
@@ -289,16 +292,18 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
-        const [dbConfigs, runList, health, cachedConfigCounts] = await Promise.all([
+        const [dbConfigs, runList, health, cachedConfigCounts, providersDataRes] = await Promise.all([
           apiGet('/configs'),
           apiGet('/runs'),
           apiGet('/health'),
-          apiGet('/blob-configs')
+          apiGet('/blob-configs'),
+          apiGet('/providers').catch(() => null)
         ]);
         setConfigs(dbConfigs);
         setBlobConfigs(cachedConfigCounts);
         setRuns(runList);
         if (health?.environment) setEnvironment(health.environment);
+        if (providersDataRes) setProvidersData(providersDataRes);
         setOptimizerAvailable(Boolean(health?.prompt_optimization_enabled && health?.prompt_optimization_key_configured));
         const latest = dbConfigs.find(c => c.config_id === health?.latest_audit_config);
         const initialConfig = latest?.config_id || dbConfigs[0]?.config_id || '';
@@ -382,7 +387,7 @@ export default function App() {
     setPreviewLoading(true);
     setPreviewTab('request');
     try {
-      const body = { blob_name: blob.name, config_id: selectedConfig };
+      const body = { blob_name: blob.name, config_id: selectedConfig, model: selectedModel };
       setPreview(await apiPost('/preview', body));
     } catch (e) {
       console.error(e);
@@ -409,12 +414,16 @@ export default function App() {
             config_ids: selectedConfigIds,
             noul_threshold: 0.5,
             optimize_prompts: optimizePrompts,
+            model: selectedModel,
+            provider: selectedModel.startsWith('laya') ? 'laya_azure' : undefined,
           }
         : {
             blob_names: selectedBlobs,
             config_id: selectedConfig,
             noul_threshold: 0.5,
             optimize_prompts: optimizePrompts,
+            model: selectedModel,
+            provider: selectedModel.startsWith('laya') ? 'laya_azure' : undefined,
           };
       const override = parseFloat(llmCostOverride);
       if (!Number.isNaN(override)) payload.llm_cost_override_usd = override;
@@ -533,7 +542,50 @@ export default function App() {
 
   const summary = activeRunData?.summary;
   const optimizerInfo = activeRunData?.records?.find(r => r.prompt_optimization?.enabled)?.prompt_optimization;
+  const candidateModelRaw =
+    activeRunData?.error_analysis?.candidate_model ||
+    activeRunData?.records?.[0]?.performance?.jev_model ||
+    activeRunData?.summary?.performance?.jev_model ||
+    '';
+  const candidateModelName = useMemo(() => {
+    const raw = String(candidateModelRaw || '').toLowerCase();
+    if (raw.includes('azure')) return 'Laya (Azure T4 GPU)';
+    if (raw.includes('finetuned') || raw.includes('fine-tuned')) return 'Laya (Fine-Tuned)';
+    if (raw.includes('laya')) return 'Laya (Azure T4 GPU)';
+    if (candidateModelRaw) return candidateModelRaw;
+    return 'TypeSafe Jev';
+  }, [candidateModelRaw]);
+  const candidateShortName = useMemo(() => {
+    if (candidateModelName.toLowerCase().includes('laya')) return 'Laya';
+    return 'Jev';
+  }, [candidateModelName]);
 
+  const filteredEvaluations = useMemo(() => {
+    const list = activeRunData?.error_analysis?.article_evaluations || [];
+    if (errorFilter === 'all') return list;
+    if (errorFilter === 'jev') return list.filter(e => ['jev', 'candidate'].includes(e.arbitration?.overall_preferred_model));
+    if (errorFilter === 'llm') return list.filter(e => e.arbitration?.overall_preferred_model === 'llm');
+    if (errorFilter === 'tie') return list.filter(e => !['llm', 'jev', 'candidate'].includes(e.arbitration?.overall_preferred_model));
+    if (errorFilter === 'prominence') {
+      return list.filter(e =>
+        e.subject_mismatches?.some(m => m.dimension === 'prominence') ||
+        e.arbitration?.verdicts?.some(v => v.dimension === 'prominence')
+      );
+    }
+    if (errorFilter === 'sentiment') {
+      return list.filter(e =>
+        e.subject_mismatches?.some(m => m.dimension === 'sentiment') ||
+        e.arbitration?.verdicts?.some(v => v.dimension === 'sentiment')
+      );
+    }
+    if (errorFilter === 'tags') {
+      return list.filter(e =>
+        (e.tag_mismatches?.length > 0) ||
+        e.arbitration?.verdicts?.some(v => v.dimension === 'tag')
+      );
+    }
+    return list;
+  }, [activeRunData?.error_analysis?.article_evaluations, errorFilter]);
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col">
       <header className="bg-[#152332] text-white shadow-md border-b border-slate-700">
@@ -670,6 +722,28 @@ export default function App() {
               <div>
                 <label
                   className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1"
+                  title="Select the System 1 decision engine. Laya Azure GPU runs on dev-002 with native FP16 Tensor Cores."
+                >
+                  Decision Engine
+                </label>
+                <select
+                  value={selectedModel}
+                  onChange={e => setSelectedModel(e.target.value)}
+                  className="px-3 py-2 border border-slate-300 rounded-lg text-sm bg-white font-medium text-slate-800 shadow-xs focus:ring-2 focus:ring-blue-500"
+                >
+                  <optgroup label="Azure Cloud GPU (Tesla T4)">
+                    <option value="laya:azure:t4">Laya: Azure Tesla T4 (Fine-Tuned 10K, Cloud GPU)</option>
+                  </optgroup>
+                  <optgroup label="Cloud API">
+                    <option value="typesafe/jev-1.13">TypeSafe Jev (OpenRouter Cloud)</option>
+                    <option value="jev-latest">TypeSafe Jev (Direct Cloud)</option>
+                  </optgroup>
+                </select>
+              </div>
+
+              <div>
+                <label
+                  className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1"
                   title="Audit blobs do not record LLM cost, so the rig needs a baseline figure. Leave blank to use the configured default."
                 >
                   LLM cost/article ($)
@@ -711,7 +785,7 @@ export default function App() {
                   disabled={runMode === 'batch' ? selectedConfigIds.length === 0 : selectedBlobs.length === 0}
                   className="px-5 py-2 rounded-lg bg-[#0b82f4] hover:bg-[#096fd1] text-white text-sm font-semibold inline-flex items-center gap-2 shadow-sm disabled:opacity-50"
                 >
-                  <Play className="w-4 h-4 fill-white" /> {runMode === 'batch' ? 'Run Batch Benchmark' : 'Run Jev Benchmark'}
+                  <Play className="w-4 h-4 fill-white" /> {runMode === 'batch' ? 'Run Batch Benchmark' : selectedModel.startsWith('laya') ? 'Run Laya Benchmark' : 'Run Jev Benchmark'}
                 </button>
               </div>
             </div>
@@ -723,7 +797,7 @@ export default function App() {
                   <FileText className="w-4 h-4 text-slate-500" />
                   Processed Article Blobs — config <span className="font-mono">{selectedConfig || '—'}</span>
                 </h3>
-                <span className="text-xs text-slate-500">Click a row to select · Preview to inspect the TypeSafe payload</span>
+                <span className="text-xs text-slate-500">Click a row to select · Preview to inspect the {selectedModel.startsWith('laya') ? 'Laya' : 'TypeSafe'} payload</span>
               </div>
 
               <div className="divide-y divide-slate-100 max-h-[640px] overflow-y-auto">
@@ -800,8 +874,8 @@ export default function App() {
                     {jobStatus.phase === 'optimizing_prompts'
                       ? `Optimizing prompts for ${jobStatus.optimizer_config || 'configuration'}…`
                       : jobStatus.mode === 'batch'
-                        ? `Evaluating ${jobStatus.current_config_id || 'configuration'} sequentially…`
-                        : 'Evaluating with TypeSafe Jev…'}
+                        ? (selectedModel.startsWith('laya') ? `Evaluating ${jobStatus.current_config_id || 'configuration'} with Laya…` : `Evaluating ${jobStatus.current_config_id || 'configuration'} sequentially…`)
+                        : (selectedModel.startsWith('laya') ? 'Evaluating with Laya…' : 'Evaluating with TypeSafe Jev…')}
                   </h4>
                   <p className="text-xs text-slate-500 mt-1">
                     {jobStatus.phase === 'optimizing_prompts'
@@ -893,7 +967,12 @@ export default function App() {
                 <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6">
                   <div className="flex items-center justify-between pb-4 border-b border-slate-200">
                     <div>
-                      <h3 className="font-bold text-slate-900 text-base">Business summary</h3>
+                      <div className="flex items-center gap-2">
+                        <h3 className="font-bold text-slate-900 text-base">Business summary</h3>
+                        <span className="px-2 py-0.5 rounded text-xs font-mono font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                          {candidateModelName}
+                        </span>
+                      </div>
                       <p className="text-xs text-slate-500">Saved to runs/{activeRunData.run_id}/benchmark_summary.md</p>
                     </div>
                     <div className="flex items-center gap-2 flex-wrap justify-end">
@@ -1175,7 +1254,7 @@ export default function App() {
         <Modal
           wide
           title={detail.headline}
-          subtitle={`LLM (${detail.performance.llm_model}) vs TypeSafe Jev (${detail.performance.jev_model})`}
+          subtitle={`LLM (${detail.performance.llm_model}) vs ${candidateModelName} (${detail.performance.jev_model})`}
           onClose={() => setDetail(null)}
         >
           <div className="space-y-5">
@@ -1219,7 +1298,7 @@ export default function App() {
                 </div>
               </div>
               <div className="p-3 rounded-lg bg-blue-50 border border-blue-200">
-                <div className="font-semibold text-blue-900 mb-1">TypeSafe Jev</div>
+                <div className="font-semibold text-blue-900 mb-1">{candidateShortName === 'Laya' ? 'Laya Decision Engine' : 'TypeSafe Jev'}</div>
                 <div className="text-blue-800 space-y-0.5">
                   <div>latency {detail.performance.jev_duration_ms} ms</div>
                   <div>
@@ -1328,8 +1407,8 @@ export default function App() {
       {analysisModalOpen && activeRunData?.error_analysis && (
         <Modal
           wide
-          title="Gemini 3.8 Error & Discrepancy Arbitration Report"
-          subtitle={`Evaluated ${activeRunData.error_analysis.sample_analyzed_count || 0} articles with disagreements · Model: ${activeRunData.error_analysis.model}`}
+          title={`Gemini 3.8 Error & Discrepancy Arbitration Report (${candidateModelName})`}
+          subtitle={`Evaluated ${activeRunData.error_analysis.sample_analyzed_count || 0} articles with disagreements · Baseline LLM vs ${candidateModelName}`}
           onClose={() => setAnalysisModalOpen(false)}
         >
           <div className="space-y-6">
@@ -1342,7 +1421,7 @@ export default function App() {
                 tone="amber"
               />
               <StatCard
-                label="Jev Preferred"
+                label={`${candidateShortName} Preferred`}
                 value={activeRunData.error_analysis.jev_preferred_count}
                 sub="Better calibrated / grounded"
                 icon={<CheckCircle2 className="w-4 h-4 text-emerald-500" />}
@@ -1375,11 +1454,35 @@ export default function App() {
             </div>
 
             <div>
-              <h4 className="font-bold text-slate-900 text-sm mb-3">
-                Detailed Article Verdicts ({activeRunData.error_analysis.article_evaluations?.length || 0})
-              </h4>
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+                <h4 className="font-bold text-slate-900 text-sm">
+                  Detailed Article Verdicts ({filteredEvaluations.length} of {activeRunData.error_analysis.article_evaluations?.length || 0})
+                </h4>
+                <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                  {[
+                    { id: 'all', label: 'All' },
+                    { id: 'jev', label: `${candidateShortName} Wins` },
+                    { id: 'llm', label: 'LLM Wins' },
+                    { id: 'prominence', label: 'Prominence' },
+                    { id: 'sentiment', label: 'Sentiment' },
+                    { id: 'tags', label: 'Tags' },
+                  ].map(f => (
+                    <button
+                      key={f.id}
+                      onClick={() => setErrorFilter(f.id)}
+                      className={`px-2.5 py-1 rounded-full font-medium transition-colors ${
+                        errorFilter === f.id
+                          ? 'bg-blue-600 text-white shadow-xs'
+                          : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
               <div className="space-y-4 max-h-[32rem] overflow-y-auto pr-1">
-                {activeRunData.error_analysis.article_evaluations?.map((ev, i) => {
+                {filteredEvaluations.map((ev, i) => {
                   const arb = ev.arbitration || {};
                   const pref = arb.overall_preferred_model;
                   return (
@@ -1396,7 +1499,7 @@ export default function App() {
                             ? 'bg-blue-100 text-blue-800 border border-blue-200'
                             : 'bg-slate-100 text-slate-700 border border-slate-200'
                         }`}>
-                          {pref === 'jev' ? '✓ Jev Correct' : pref === 'llm' ? '✓ LLM Correct' : 'Tie / Defensible'}
+                          {pref === 'jev' || pref === 'candidate' ? `✓ ${candidateShortName} Correct` : pref === 'llm' ? '✓ LLM Correct' : 'Tie / Defensible'}
                         </span>
                       </div>
 
@@ -1420,12 +1523,12 @@ export default function App() {
                                     ? 'bg-blue-100 text-blue-800'
                                     : 'bg-amber-100 text-amber-800'
                                 }`}>
-                                  Winner: {v.correct_model}
+                                  Winner: {v.correct_model === 'jev' || v.correct_model === 'candidate' ? candidateShortName : v.correct_model === 'llm' ? 'LLM' : v.correct_model}
                                 </span>
                               </div>
                               <div className="grid grid-cols-2 gap-2 text-[11px] my-1 font-mono text-slate-600">
                                 <div>LLM: <span className="font-semibold text-slate-800">{String(v.llm_value)}</span></div>
-                                <div>Jev: <span className="font-semibold text-slate-800">{String(v.jev_value)}</span></div>
+                                <div>{candidateShortName}: <span className="font-semibold text-slate-800">{String(v.jev_value)}</span></div>
                               </div>
                               <p className="text-slate-600 text-[11px] mt-1 pt-1 border-t border-slate-200/60 leading-normal">
                                 {v.reasoning}

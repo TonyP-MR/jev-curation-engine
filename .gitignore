@@ -26,3 +26,9 @@ runs/
 .DS_Store
 .idea/
 .vscode/
+
+# Tooling and logs
+*.log
+.omp/
+.agents/
+_bmad/
