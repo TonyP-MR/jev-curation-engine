@@ -1061,7 +1061,7 @@ export default function App() {
                           </span>
                         </div>
                         <div className="bg-white/80 p-2 rounded border border-indigo-100">
-                          <span className="text-emerald-700 block font-medium">Jev Preferred</span>
+                          <span className="text-emerald-700 block font-medium">{candidateShortName} Preferred</span>
                           <span className="font-bold text-emerald-800 text-sm">{activeRunData.error_analysis.jev_preferred_count}</span>
                         </div>
                         <div className="bg-white/80 p-2 rounded border border-indigo-100">
@@ -1088,7 +1088,7 @@ export default function App() {
                     <h3 className="font-semibold text-slate-900 text-sm">
                       Article results ({activeRunData.records?.length || 0})
                     </h3>
-                    <span className="text-xs text-slate-500">Open Compare for LLM vs Jev side by side</span>
+                    <span className="text-xs text-slate-500">Open Compare for LLM vs {candidateShortName} side by side</span>
                   </div>
                   <div className="divide-y divide-slate-100">
                     {activeRunData.records?.filter(r => !r.skipped && !r.failed && r.metrics).map((record, i) => (
@@ -1337,7 +1337,7 @@ export default function App() {
                       <div className="grid grid-cols-[6rem_minmax(0,1fr)_minmax(0,1fr)_1.25rem] items-center gap-2 text-[10px] uppercase tracking-wider text-slate-400 font-semibold mb-1">
                         <span></span>
                         <span>LLM</span>
-                        <span>Jev</span>
+                        <span>{candidateShortName}</span>
                         <span></span>
                       </div>
                       <div className="space-y-1 text-xs">
@@ -1387,14 +1387,14 @@ export default function App() {
                 <JsonBlock value={detail.llm_output?.parsed_raw_response ?? 'not archived'} />
               </div>
               <div>
-                <h4 className="font-semibold text-slate-900 text-sm mb-2">TypeSafe response</h4>
+                <h4 className="font-semibold text-slate-900 text-sm mb-2">{candidateShortName === 'Laya' ? 'Laya raw response' : 'TypeSafe response'}</h4>
                 <JsonBlock value={detail.jev_response ?? 'not archived'} />
               </div>
             </div>
 
             <details>
               <summary className="text-xs font-semibold text-slate-600 cursor-pointer">
-                TypeSafe request payload sent for this article
+                {candidateShortName === 'Laya' ? 'Laya request payload sent for this article' : 'TypeSafe request payload sent for this article'}
               </summary>
               <div className="mt-2">
                 <JsonBlock value={detail.jev_request ?? 'not archived'} maxHeight="max-h-72" />
