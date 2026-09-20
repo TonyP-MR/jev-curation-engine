@@ -463,7 +463,9 @@ async def execute_benchmark_task(
                             for s_id, res_list in subject_aliases_map.items()
                         }
                         max_mentions_in_article = max(subject_mentions_map.values(), default=0)
-
+                        # Identify multi-entity guides/comparisons where 2 or more entities have substantial mentions (>= 3)
+                        major_entity_count = sum(1 for cnt in subject_mentions_map.values() if cnt >= 3)
+                        is_multi_entity_overview = (major_entity_count >= 2)
                         for s in snapshot.get("subjects", []):
                             s_id = str(s["id"])
                             s_name = s.get("name")
@@ -485,6 +487,11 @@ async def execute_benchmark_task(
                                 if not in_hl and mention_count <= 1:
                                     p_ans["choice"] = "passing"
                                     p_ans["confidence"] = 0.95
+                                # Multi-entity overview ceiling: In a multi-carrier guide/roundup without headline focus,
+                                # parallel major competitors cannot be primary (must be significant or passing)
+                                elif is_multi_entity_overview and not in_hl:
+                                    p_ans["choice"] = "significant" if mention_count >= 3 else "passing"
+                                    p_ans["confidence"] = 0.90
                                 # Relative share constraint: An entity with far fewer mentions than the dominant entity cannot be primary
                                 elif max_mentions_in_article >= 5 and mention_count <= 2 and not in_hl:
                                     p_ans["choice"] = "passing"
@@ -518,9 +525,20 @@ async def execute_benchmark_task(
                                 if s_ans.get("type") == "choice":
                                     probs = dict(s_ans.get("probabilities", {}))
                                     if probs and "neutral" in probs:
-                                        probs["neutral"] = probs.get("neutral", 0.0) * 1.8
-                                        probs["positive"] = probs.get("positive", 0.0) * 0.55
-                                        probs["negative"] = probs.get("negative", 0.0) * 0.85
+                                        # Check for explicit corporate adversity / conflict signals
+                                        adversity_markers = ("severed", "cut line", "disrupt", "damage", "complaint", "halted", "stop-work", "lawsuit", "investigat", "outage", "fine", "penalty", "critic")
+                                        has_adversity = any(m in full_text.lower() for m in adversity_markers)
+                                        raw_neg = probs.get("negative", 0.0)
+                                        
+                                        if has_adversity and raw_neg >= 0.25:
+                                            # Do not dilute negative sentiment when concrete adversity exists
+                                            probs["negative"] = raw_neg * 1.5
+                                            probs["neutral"] = probs.get("neutral", 0.0) * 0.9
+                                        else:
+                                            probs["neutral"] = probs.get("neutral", 0.0) * 1.8
+                                            probs["positive"] = probs.get("positive", 0.0) * 0.55
+                                            probs["negative"] = probs.get("negative", 0.0) * 0.85
+                                        
                                         probs["balanced"] = probs.get("balanced", 0.0) * 0.5
                                         s_tot = sum(probs.values())
                                         if s_tot > 0:
