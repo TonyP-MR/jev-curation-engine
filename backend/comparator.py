@@ -236,12 +236,11 @@ def compare_article_results(
                     jev_tag_raw = jev_tag_prob >= tag_thresh
                     subject_is_valid = jev_valid_by_subject.get(s_id, False)
                     jev_tag_res = jev_tag_raw if subject_is_valid else False
-                    
+                    tag_total += 1
                     llm_tag_res = blob_llm_tags.get(t_id, False)
                     tag_match = (llm_tag_res == jev_tag_res)
                     if tag_match:
                         tag_correct += 1
-
                     tag_comparisons.append({
                         "subject_id": s_id,
                         "tag_id": t_id,
