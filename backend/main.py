@@ -536,6 +536,7 @@ async def execute_benchmark_task(
                         snapshot=snapshot,
                         noul_threshold=req.noul_threshold,
                         llm_cost_override_usd=req.llm_cost_override_usd,
+                        tag_threshold=req.noul_threshold if req.noul_threshold != 0.50 else getattr(settings, "TAG_THRESHOLD", 0.40),
                     )
                     comparison["config_version"] = config_data["metadata"]
                     comparison["prompt_optimization"] = optimizer_metadata

@@ -232,7 +232,7 @@ def compare_article_results(
                 if q_key in answers:
                     jev_tag_ans = answers[q_key]
                     jev_tag_prob = jev_tag_ans.get("noul", 0.0)
-                    tag_thresh = tag_threshold if tag_threshold is not None else getattr(settings, "TAG_THRESHOLD", 0.55)
+                    tag_thresh = tag_threshold if tag_threshold is not None else getattr(settings, "TAG_THRESHOLD", 0.40)
                     jev_tag_raw = jev_tag_prob >= tag_thresh
                     subject_is_valid = jev_valid_by_subject.get(s_id, False)
                     jev_tag_res = jev_tag_raw if subject_is_valid else False
