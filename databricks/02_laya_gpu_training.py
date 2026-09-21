@@ -236,7 +236,34 @@ def fit_temperature(logits_by_type):
     return temps
 
 
+DEBUG_LOG_DIR = "/dbfs/tmp/laya_train_debug"
+
+
 def train():
+    """Runs training, leaving a per-rank traceback behind on failure.
+
+    TorchDistributor reports only "failed during training" and the child
+    stderr is not delivered anywhere durable, so a crash inside a rank is
+    otherwise invisible. Writing the traceback to DBFS makes it readable
+    after the run is gone.
+    """
+    import traceback
+
+    rank = os.environ.get("RANK", "0")
+    try:
+        return _train_impl()
+    except BaseException:
+        try:
+            os.makedirs(DEBUG_LOG_DIR, exist_ok=True)
+            with open(f"{DEBUG_LOG_DIR}/rank_{rank}.log", "w") as fh:
+                fh.write(traceback.format_exc())
+        except Exception as write_err:
+            logger.error(f"Could not persist rank {rank} traceback: {write_err}")
+        logger.error(f"[rank {rank}] {traceback.format_exc()}")
+        raise
+
+
+def _train_impl():
     import laya
     from laya.common import collate_items
     from safetensors.torch import save_file
@@ -662,6 +689,13 @@ with mlflow.start_run(run_name=f"laya-{EPOCHS}ep-top{TOP_LAYERS}-pw{POS_WEIGHT}"
         "gpu": torch.cuda.get_device_name(0),
     })
 
+    # TorchDistributor pickles the training function by reference: module name
+    # plus qualname. Each torchrun child is a fresh interpreter that re-imports
+    # `laya_train_fn`, so the path has to reach them through the environment.
+    # A driver-only sys.path.insert leaves the children unable to import it and
+    # they die in about four seconds, before the function body ever runs.
+    TRAIN_FN_DIR = "/local_disk0"
+    inherited_path = os.environ.get("PYTHONPATH", "")
     os.environ.update({
         "LAYA_STAGING_DIR": STAGING_DIR,
         "LAYA_OUTPUT_DIR": OUTPUT_DIR,
@@ -673,10 +707,16 @@ with mlflow.start_run(run_name=f"laya-{EPOCHS}ep-top{TOP_LAYERS}-pw{POS_WEIGHT}"
         "LAYA_POS_WEIGHT": str(POS_WEIGHT),
         "LAYA_MLFLOW_RUN_ID": run.info.run_id,
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "PYTHONPATH": (
+            f"{TRAIN_FN_DIR}:{inherited_path}" if inherited_path else TRAIN_FN_DIR
+        ),
+        # Auth for the child ranks is inherited from the driver environment.
+        # If rank 0 cannot reach MLflow, rank_0.log will say so.
     })
 
     import sys
-    sys.path.insert(0, "/local_disk0")
+    if TRAIN_FN_DIR not in sys.path:
+        sys.path.insert(0, TRAIN_FN_DIR)
     import laya_train_fn
     import importlib
     importlib.reload(laya_train_fn)
