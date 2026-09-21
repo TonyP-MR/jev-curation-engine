@@ -397,6 +397,15 @@ export default function App() {
     }
   };
 
+  // The model string is the source of truth. The backend resolves the engine
+  // from it, so the provider only needs to disambiguate the Laya variants.
+  const providerFor = model => {
+    if (model.startsWith('laya:databricks:local')) return 'laya_local';
+    if (model.startsWith('laya:databricks')) return 'laya_databricks';
+    if (model.startsWith('laya')) return 'laya_azure';
+    return undefined;
+  };
+
   const runBenchmark = async () => {
     const isBatch = runMode === 'batch';
     if (isBatch ? selectedConfigIds.length === 0 : selectedBlobs.length === 0) return;
@@ -415,7 +424,7 @@ export default function App() {
             noul_threshold: 0.5,
             optimize_prompts: optimizePrompts,
             model: selectedModel,
-            provider: selectedModel.startsWith('laya') ? 'laya_azure' : undefined,
+            provider: providerFor(selectedModel),
           }
         : {
             blob_names: selectedBlobs,
@@ -423,7 +432,7 @@ export default function App() {
             noul_threshold: 0.5,
             optimize_prompts: optimizePrompts,
             model: selectedModel,
-            provider: selectedModel.startsWith('laya') ? 'laya_azure' : undefined,
+            provider: providerFor(selectedModel),
           };
       const override = parseFloat(llmCostOverride);
       if (!Number.isNaN(override)) payload.llm_cost_override_usd = override;
@@ -549,6 +558,7 @@ export default function App() {
     '';
   const candidateModelName = useMemo(() => {
     const raw = String(candidateModelRaw || '').toLowerCase();
+    if (raw.includes('databricks')) return 'Laya (Databricks)';
     if (raw.includes('azure')) return 'Laya (Azure T4 GPU)';
     if (raw.includes('finetuned') || raw.includes('fine-tuned')) return 'Laya (Fine-Tuned)';
     if (raw.includes('laya')) return 'Laya (Azure T4 GPU)';
@@ -722,7 +732,7 @@ export default function App() {
               <div>
                 <label
                   className="block text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1"
-                  title="Select the System 1 decision engine. Laya Azure GPU runs on dev-002 with native FP16 Tensor Cores."
+                  title="Select the System 1 decision engine. Laya Azure GPU runs on dev-002; Laya Databricks runs the model trained on the Databricks GPU cluster."
                 >
                   Decision Engine
                 </label>
@@ -733,6 +743,10 @@ export default function App() {
                 >
                   <optgroup label="Azure Cloud GPU (Tesla T4)">
                     <option value="laya:azure:t4">Laya: Azure Tesla T4 (Fine-Tuned 10K, Cloud GPU)</option>
+                  </optgroup>
+                  <optgroup label="Databricks">
+                    <option value="laya:databricks">Laya: Databricks Model Serving (GPU endpoint)</option>
+                    <option value="laya:databricks:local">Laya: Databricks Weights (local MPS)</option>
                   </optgroup>
                   <optgroup label="Cloud API">
                     <option value="typesafe/jev-1.13">TypeSafe Jev (OpenRouter Cloud)</option>

@@ -20,6 +20,7 @@ _MANAGED_KEYS = [
     "LLM_INPUT_COST_PER_MTOK", "LLM_OUTPUT_COST_PER_MTOK",
     "LLM_FLAT_COST_PER_ARTICLE_USD",
     "LAYA_MODEL", "LAYA_DEVICE", "LAYA_REMOTE_URL", "LAYA_API_KEY",
+    "DATABRICKS_HOST", "DATABRICKS_TOKEN", "LAYA_DATABRICKS_ENDPOINT",
 ]
 
 
@@ -103,6 +104,12 @@ class Settings(BaseSettings):
     LAYA_DEVICE: str = "mps"
     LAYA_REMOTE_URL: str = "http://20.90.113.57:8000/api/alpha/decisions"
     LAYA_API_KEY: str = "laya_sec_8bc85b1d61947e71783c7ad23a65f14534558bf4127af230"
+    # --- Databricks Model Serving (System 1 engine trained on Databricks GPU) ---
+    # DATABRICKS_TOKEN is a PAT or service-principal token. The endpoint name is
+    # the serving endpoint, not the Unity Catalog model name.
+    DATABRICKS_HOST: str = ""
+    DATABRICKS_TOKEN: str = ""
+    LAYA_DATABRICKS_ENDPOINT: str = "laya-curation-engine"
     BENCHMARK_CONCURRENCY: int = 5
     LAYA_BENCHMARK_CONCURRENCY: int = 8
     VALIDATION_THRESHOLD: float = 0.45

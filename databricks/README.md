@@ -80,6 +80,64 @@ The train/validation split is hashed on `correlation_id` rather than sampled per
 row. The Azure split put sequences from the same article on both sides, so the
 reported 83.33% included memorized article text.
 
+## Using the trained model in the test rig
+
+Notebook 02 logs an MLflow `pyfunc`, not just the raw weights. A bare artifact
+directory registers fine but cannot be invoked, so the rig would have nothing to
+call. The wrapper reproduces the two-stage gating in `backend/laya_runner.py`:
+validation questions run first, and prominence, sentiment and tag questions are
+only asked about subjects that passed. Subjects that failed get the same
+hard-coded defaults the local runner applies, so a served answer and a local
+answer agree for the same input.
+
+The response envelope matches the Azure service, which is what lets the rig
+treat both as interchangeable engines.
+
+Two ways to run it, both in the **Decision Engine** dropdown:
+
+### Databricks Model Serving
+
+Select **Laya: Databricks Model Serving (GPU endpoint)**. Notebook 02 creates or
+updates the endpoint named by the `serving_endpoint` widget after a run clears
+the accuracy gate. The rig needs three values in the repo-root `.env`:
+
+```
+DATABRICKS_HOST=https://dbc-34034be3-652f.cloud.databricks.com
+DATABRICKS_TOKEN=<PAT or service-principal token>
+LAYA_DATABRICKS_ENDPOINT=laya-curation-engine
+```
+
+`GET /api/providers` reports `configured: true` once they resolve. The endpoint
+is created with `scale_to_zero_enabled`, so an idle endpoint bills nothing and
+the first request after idle pays a cold start.
+
+### Local weights
+
+Select **Laya: Databricks Weights (local MPS)** after pulling the weights down:
+
+```bash
+uv run python scripts/fetch_databricks_model.py            # latest version
+uv run python scripts/fetch_databricks_model.py --version 4
+```
+
+That writes `runs/laya_databricks/`, which `backend/laya_runner.py` resolves by
+name. Cheaper than a warm GPU endpoint and one less network hop per decision, so
+it is the better option for iterating on thresholds against a fresh model.
+
+### How a selection is routed
+
+The model string is the source of truth. `TypeSafeRunner._resolve_engine` maps
+it to an engine, and the `provider` field only disambiguates the Laya variants.
+Order matters: `laya:databricks:local` is checked before `laya:databricks`
+because one is a prefix of the other.
+
+| Dropdown value | Engine | Where it runs |
+|---|---|---|
+| `laya:azure:t4` | `laya_azure` | `dev-002` in uksouth |
+| `laya:databricks` | `laya_databricks` | Databricks Model Serving |
+| `laya:databricks:local` | `laya_local` | `runs/laya_databricks` on local MPS |
+| `jev-latest`, `typesafe/jev-1.13` | `jev` | TypeSafe or OpenRouter |
+
 ## Keeping the prompts in sync
 
 Notebook 01 inlines the question-building logic from

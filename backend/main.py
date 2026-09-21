@@ -104,6 +104,29 @@ def list_providers():
                 ],
             },
             {
+                "id": "laya_databricks",
+                "name": "Laya Databricks (Model Serving GPU)",
+                "configured": bool(settings.DATABRICKS_HOST and settings.DATABRICKS_TOKEN),
+                "models": [
+                    {
+                        "id": "laya:databricks",
+                        "name": "Laya: Databricks Model Serving (GPU endpoint)",
+                        "description": (
+                            f"Serving endpoint '{settings.LAYA_DATABRICKS_ENDPOINT}' backed by the "
+                            "Unity Catalog model trained on the Databricks GPU cluster"
+                        ),
+                    },
+                    {
+                        "id": "laya:databricks:local",
+                        "name": "Laya: Databricks Weights (local MPS)",
+                        "description": (
+                            "Same weights pulled down by scripts/fetch_databricks_model.py "
+                            "and run on local Apple Silicon"
+                        ),
+                    },
+                ],
+            },
+            {
                 "id": "openrouter",
                 "name": "OpenRouter Jev (Proxy Cloud API)",
                 "models": [{"id": "typesafe/jev-1.13", "name": "typesafe/jev-1.13"}],
@@ -442,7 +465,7 @@ async def execute_benchmark_task(
                             jev_result.setdefault("answers", {}).update(gated_answers)
                         else:
                             jev_result = {
-                                "provider": "laya_azure",
+                                "provider": (req.provider or "laya_azure").lower(),
                                 "model": req.model or "laya:azure:t4:finetuned-10k",
                                 "answers": gated_answers,
                                 "usage": {"input_tokens": 0, "output_tokens": 0},

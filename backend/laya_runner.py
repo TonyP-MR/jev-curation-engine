@@ -53,6 +53,20 @@ class LayaRunner:
                     "subfolder": None,
                     "display_name": "laya-finetuned",
                 }
+        databricks_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "runs", "laya_databricks")
+        )
+        if clean in (
+            "laya:databricks:local",
+            "databricks:local",
+            "laya-databricks",
+        ) and os.path.isdir(databricks_dir):
+            return {
+                "model_id_or_path": databricks_dir,
+                "subfolder": None,
+                "display_name": "laya-databricks",
+            }
+
         clean = raw.lower()
         if clean in ("laya", "laya:typed-decisions", "typed-decisions"):
             return {

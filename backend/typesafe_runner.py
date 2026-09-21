@@ -1,11 +1,22 @@
-from typing import Any, Dict, List, Optional
-import time
+import asyncio
+import json
 import logging
-from typing import Any, Dict, Optional
+import time
+from typing import Any, Dict, List, Optional
+
 import httpx
+
 from config import settings
 from laya_runner import laya_runner
+
 logger = logging.getLogger(__name__)
+
+# System 1 engines answer over HTTP with the same decision contract, so the only
+# thing that varies between them is where to post and how to read the envelope.
+LAYA_AZURE = "laya_azure"
+LAYA_DATABRICKS = "laya_databricks"
+LAYA_LOCAL = "laya_local"
+
 
 class TypeSafeRunner:
     def __init__(self):
@@ -25,6 +36,82 @@ class TypeSafeRunner:
             limits = httpx.Limits(max_keepalive_connections=50, max_connections=100)
             self._client = httpx.AsyncClient(limits=limits, timeout=120.0)
         return self._client
+
+    # ------------------------------------------------------------------
+    # Engine routing
+    # ------------------------------------------------------------------
+
+    def _resolve_engine(
+        self, model: Optional[str], provider: Optional[str]
+    ) -> tuple[str, str]:
+        """Returns (engine, target_model) for a UI selection.
+
+        The frontend sends the model string as the source of truth; `provider` is
+        only a hint. Both are checked so an explicit provider still wins when the
+        caller omits the model.
+        """
+        hint = (provider or self.provider).lower()
+        target = model or (settings.LAYA_MODEL if hint.startswith("laya") else self.model)
+        name = str(target or "").lower()
+
+        # Checked first: the downloaded-weights variant is a prefix of the
+        # served variant, so ordering decides which branch wins.
+        if hint == LAYA_LOCAL or name.startswith(("local:", "laya:local", "laya:databricks:local")):
+            return LAYA_LOCAL, target
+        if hint == LAYA_DATABRICKS or name.startswith("laya:databricks"):
+            return LAYA_DATABRICKS, target
+        if hint in (LAYA_AZURE, "laya") or name.startswith("laya:azure"):
+            return LAYA_AZURE, target
+        return "jev", target
+
+    def _laya_transport(self, engine: str) -> dict[str, Any]:
+        """Endpoint, auth and wire model name for a remote System 1 engine."""
+        if engine == LAYA_DATABRICKS:
+            host = settings.DATABRICKS_HOST.rstrip("/")
+            endpoint = settings.LAYA_DATABRICKS_ENDPOINT
+            if not host or not endpoint:
+                raise RuntimeError(
+                    "Databricks engine selected but DATABRICKS_HOST or "
+                    "LAYA_DATABRICKS_ENDPOINT is unset."
+                )
+            if not settings.DATABRICKS_TOKEN:
+                raise RuntimeError("Databricks engine selected but DATABRICKS_TOKEN is unset.")
+            return {
+                "url": f"{host}/serving-endpoints/{endpoint}/invocations",
+                "api_key": settings.DATABRICKS_TOKEN,
+                "batch_url": f"{host}/serving-endpoints/{endpoint}/invocations",
+                "wire_model": "laya:databricks",
+                "default_model": f"laya:databricks:{endpoint}",
+                # Databricks Model Serving speaks the MLflow scoring protocol
+                # rather than the bespoke shape the Azure service exposes.
+                "protocol": "mlflow",
+            }
+        return {
+            "url": settings.LAYA_REMOTE_URL,
+            "api_key": settings.LAYA_API_KEY,
+            "batch_url": settings.LAYA_REMOTE_URL.replace("/decisions", "/decisions/batch"),
+            "wire_model": "laya:azure:t4",
+            "default_model": "laya:azure:t4:finetuned-10k",
+            "protocol": "native",
+        }
+
+    @staticmethod
+    def _unwrap_mlflow(data: Any) -> Dict[str, Any]:
+        """Pulls the decision envelope out of an MLflow scoring response."""
+        if isinstance(data, dict):
+            preds = data.get("predictions", data)
+        else:
+            preds = data
+        if isinstance(preds, list):
+            preds = preds[0] if preds else {}
+        if isinstance(preds, str):
+            preds = json.loads(preds)
+        return preds if isinstance(preds, dict) else {}
+
+    # ------------------------------------------------------------------
+    # Single article
+    # ------------------------------------------------------------------
+
     async def evaluate_article(
         self,
         state: str,
@@ -32,111 +119,78 @@ class TypeSafeRunner:
         model: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
-        effective_provider = (provider or self.provider).lower()
-        target_model = model or (settings.LAYA_MODEL if effective_provider.startswith("laya") else self.model)
+        engine, target_model = self._resolve_engine(model, provider)
 
-        if (
-            effective_provider in ("laya_azure", "laya")
-            or (model and str(model).lower().startswith("laya:azure"))
-            or (target_model and str(target_model).lower().startswith("laya:azure"))
-        ):
-            t0 = time.perf_counter()
-            payload = {
-                "state": state,
-                "model": "laya:azure:t4",
-                "questions": questions,
-            }
-            headers = {
-                "Authorization": f"Bearer {settings.LAYA_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            client = self._get_client()
-            resp = await client.post(settings.LAYA_REMOTE_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            duration_ms = (time.perf_counter() - t0) * 1000.0
-            usage = data.get("usage", {})
-            return {
-                "provider": "laya_azure",
-                "model": data.get("model", "laya:azure:t4:finetuned-10k"),
-                "answers": data.get("answers", {}),
-                "usage": {
-                    "input_tokens": int(usage.get("input_tokens", 0)),
-                    "output_tokens": 0,
-                },
-                "duration_ms": round(duration_ms, 2),
-                "cost_usd": 0.0,
-                "request_payload": payload,
-                "raw_response": data,
-            }
-    async def evaluate_article_batch(
-        self,
-        batch_items: List[Dict[str, Any]],
-        model: Optional[str] = None,
-        provider: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Evaluates multiple articles concurrently using the Azure GPU batch endpoint."""
-        effective_provider = (provider or self.provider).lower()
-        if (
-            effective_provider in ("laya_azure", "laya")
-            or (model and str(model).lower().startswith("laya:azure"))
-        ):
-            endpoint = settings.LAYA_REMOTE_URL.replace("/decisions", "/decisions/batch")
-            headers = {
-                "Authorization": f"Bearer {settings.LAYA_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            client = self._get_client()
-            payload = {
-                "items": [
-                    {
-                        "state": item["state"],
-                        "questions": item["questions"],
-                        "model": "laya:azure:t4",
-                    }
-                    for item in batch_items
-                ]
-            }
-            t0 = time.perf_counter()
-            resp = await client.post(endpoint, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            total_dur = (time.perf_counter() - t0) * 1000.0
-            per_item_dur = round(total_dur / max(1, len(batch_items)), 2)
-
-            results = []
-            for item, res in zip(batch_items, data.get("results", [])):
-                usage = res.get("usage", {})
-                results.append({
-                    "provider": "laya_azure",
-                    "model": data.get("model", "laya:azure:t4:finetuned-10k"),
-                    "answers": res.get("answers", {}),
-                    "usage": {
-                        "input_tokens": int(usage.get("input_tokens", 0)),
-                        "output_tokens": 0,
-                    },
-                    "duration_ms": per_item_dur,
-                    "cost_usd": 0.0,
-                    "request_payload": item,
-                    "raw_response": res,
-                })
-            return results
-        else:
-            return await asyncio.gather(*[
-                self.evaluate_article(state=it["state"], questions=it["questions"], model=model, provider=provider)
-                for it in batch_items
-            ])
-
-        if effective_provider in ("laya_local",) or (model and (str(model).lower().startswith("local:"))):
+        if engine == LAYA_LOCAL:
             return await laya_runner.evaluate_article(
                 state=state,
                 questions=questions,
                 model=target_model,
             )
+
+        if engine in (LAYA_AZURE, LAYA_DATABRICKS):
+            return await self._evaluate_laya_remote(engine, state, questions)
+
+        return await self._evaluate_jev(state, questions, target_model)
+
+    async def _evaluate_laya_remote(
+        self,
+        engine: str,
+        state: str,
+        questions: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        transport = self._laya_transport(engine)
+        t0 = time.perf_counter()
+
+        if transport["protocol"] == "mlflow":
+            payload = {
+                "dataframe_records": [
+                    {"state": state, "questions": json.dumps(questions)}
+                ]
+            }
+        else:
+            payload = {
+                "state": state,
+                "model": transport["wire_model"],
+                "questions": questions,
+            }
+
+        headers = {
+            "Authorization": f"Bearer {transport['api_key']}",
+            "Content-Type": "application/json",
+        }
+        client = self._get_client()
+        resp = await client.post(transport["url"], json=payload, headers=headers)
+        resp.raise_for_status()
+        raw = resp.json()
+        data = self._unwrap_mlflow(raw) if transport["protocol"] == "mlflow" else raw
+
+        duration_ms = (time.perf_counter() - t0) * 1000.0
+        usage = data.get("usage", {}) or {}
+        return {
+            "provider": engine,
+            "model": data.get("model", transport["default_model"]),
+            "answers": data.get("answers", {}),
+            "usage": {
+                "input_tokens": int(usage.get("input_tokens", 0)),
+                "output_tokens": 0,
+            },
+            "duration_ms": round(duration_ms, 2),
+            "cost_usd": 0.0,
+            "request_payload": payload,
+            "raw_response": raw,
+        }
+
+    async def _evaluate_jev(
+        self,
+        state: str,
+        questions: Dict[str, Dict[str, Any]],
+        target_model: str,
+    ) -> Dict[str, Any]:
         if self.provider == "openrouter":
             root = self.api_base.rstrip("/")
             if root.endswith("/api/v1"):
-                root = root[:-len("/api/v1")]
+                root = root[: -len("/api/v1")]
             endpoint = f"{root}/api/alpha/decisions"
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
@@ -147,14 +201,16 @@ class TypeSafeRunner:
                 "User-Agent": settings.OPENROUTER_USER_AGENT or settings.OPENROUTER_APP_TITLE,
             }
         else:
+            endpoint = f"{self.api_base.rstrip('/')}/api/alpha/decisions"
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             }
+
         payload = {
             "state": state,
             "model": target_model,
-            "questions": questions
+            "questions": questions,
         }
         start_time = time.perf_counter()
         data = None
@@ -167,7 +223,8 @@ class TypeSafeRunner:
                     current_state = payload.get("state", "")
                     new_len = len(current_state) // 2
                     logger.warning(
-                        f"Jev {self.provider} max_tokens_exceeded on attempt {attempt + 1}. Throttling state from {len(current_state)} to {new_len} chars and retrying..."
+                        f"Jev {self.provider} max_tokens_exceeded on attempt {attempt + 1}. "
+                        f"Throttling state from {len(current_state)} to {new_len} chars and retrying..."
                     )
                     payload["state"] = current_state[:new_len] + "\n\n[... truncated due to max_tokens_exceeded ...]"
                     await asyncio.sleep(1.0)
@@ -192,6 +249,10 @@ class TypeSafeRunner:
                     await asyncio.sleep(wait_sec)
                     continue
                 raise
+
+        if data is None:
+            raise RuntimeError(f"Jev {self.provider} API exhausted {max_retries} retries without a response.")
+
         duration_ms = (time.perf_counter() - start_time) * 1000.0
         usage = data.get("usage", {})
         input_tokens = usage.get("input_tokens", 0)
@@ -206,7 +267,7 @@ class TypeSafeRunner:
             "answers": data.get("answers", {}),
             "usage": {
                 "input_tokens": input_tokens,
-                "output_tokens": output_tokens
+                "output_tokens": output_tokens,
             },
             "duration_ms": round(duration_ms, 2),
             "cost_usd": cost_usd,
@@ -214,5 +275,93 @@ class TypeSafeRunner:
             "request_payload": payload,
             "raw_response": data,
         }
+
+    # ------------------------------------------------------------------
+    # Batch
+    # ------------------------------------------------------------------
+
+    async def evaluate_article_batch(
+        self,
+        batch_items: List[Dict[str, Any]],
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Evaluates multiple articles through a GPU batch endpoint where one exists."""
+        engine, _ = self._resolve_engine(model, provider)
+
+        if engine in (LAYA_AZURE, LAYA_DATABRICKS):
+            return await self._evaluate_laya_remote_batch(engine, batch_items)
+
+        return await asyncio.gather(*[
+            self.evaluate_article(
+                state=it["state"], questions=it["questions"], model=model, provider=provider
+            )
+            for it in batch_items
+        ])
+
+    async def _evaluate_laya_remote_batch(
+        self,
+        engine: str,
+        batch_items: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        transport = self._laya_transport(engine)
+        headers = {
+            "Authorization": f"Bearer {transport['api_key']}",
+            "Content-Type": "application/json",
+        }
+
+        if transport["protocol"] == "mlflow":
+            payload = {
+                "dataframe_records": [
+                    {"state": item["state"], "questions": json.dumps(item["questions"])}
+                    for item in batch_items
+                ]
+            }
+        else:
+            payload = {
+                "items": [
+                    {
+                        "state": item["state"],
+                        "questions": item["questions"],
+                        "model": transport["wire_model"],
+                    }
+                    for item in batch_items
+                ]
+            }
+
+        client = self._get_client()
+        t0 = time.perf_counter()
+        resp = await client.post(transport["batch_url"], json=payload, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        total_dur = (time.perf_counter() - t0) * 1000.0
+        per_item_dur = round(total_dur / max(1, len(batch_items)), 2)
+
+        if transport["protocol"] == "mlflow":
+            preds = data.get("predictions", []) if isinstance(data, dict) else data
+            entries = [p if isinstance(p, dict) else json.loads(p) for p in (preds or [])]
+            model_name = transport["default_model"]
+        else:
+            entries = data.get("results", [])
+            model_name = data.get("model", transport["default_model"])
+
+        results = []
+        for item, res in zip(batch_items, entries):
+            usage = res.get("usage", {}) or {}
+            results.append({
+                "provider": engine,
+                "model": res.get("model", model_name),
+                "answers": res.get("answers", {}),
+                "usage": {
+                    "input_tokens": int(usage.get("input_tokens", 0)),
+                    "output_tokens": 0,
+                },
+                "duration_ms": per_item_dur,
+                "cost_usd": 0.0,
+                "request_payload": item,
+                "raw_response": res,
+            })
+        return results
+
 
 typesafe_runner = TypeSafeRunner()

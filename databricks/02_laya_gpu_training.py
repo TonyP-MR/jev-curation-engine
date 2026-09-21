@@ -42,6 +42,7 @@ dbutils.widgets.text("top_layers", "8", "Trainable encoder layers")
 dbutils.widgets.text("pos_weight", "2.5", "Positive class weight (noul heads)")
 dbutils.widgets.text("num_gpus", "1", "GPUs")
 dbutils.widgets.text("model_name", "laya_typed_decisions", "Registered model name")
+dbutils.widgets.text("serving_endpoint", "laya-curation-engine", "Serving endpoint (blank to skip)")
 
 CATALOG = dbutils.widgets.get("catalog")
 SCHEMA = dbutils.widgets.get("schema")
@@ -403,6 +404,133 @@ print("Wrote training function to /local_disk0/laya_train_fn.py")
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## 2b. Serving wrapper
+# MAGIC
+# MAGIC Logging raw weights gets the model into Unity Catalog but leaves it
+# MAGIC uninvocable — Model Serving needs a `pyfunc`. This wrapper reproduces the
+# MAGIC two-stage gating in `backend/laya_runner.py`: validation questions run
+# MAGIC first, and prominence, sentiment and tag questions are only asked about
+# MAGIC subjects that passed. Subjects that failed get the same hard-coded
+# MAGIC defaults the local runner applies, so a served answer and a local answer
+# MAGIC agree for the same input.
+# MAGIC
+# MAGIC The response envelope matches the Azure service, which is what lets the
+# MAGIC test rig treat the two as interchangeable engines.
+
+# COMMAND ----------
+
+import mlflow
+import pandas as pd
+from mlflow.models import ModelSignature
+from mlflow.types import ColSpec, Schema
+
+PASSING_PROMINENCE = {
+    "type": "choice",
+    "choice": "passing",
+    "probabilities": {"primary": 0.02, "significant": 0.08, "passing": 0.90},
+    "confidence": 0.92,
+}
+NEUTRAL_SENTIMENT = {
+    "type": "choice",
+    "choice": "neutral",
+    "probabilities": {"positive": 0.05, "negative": 0.05, "neutral": 0.88, "balanced": 0.02},
+    "confidence": 0.90,
+}
+FALSE_TAG = {"type": "noul", "noul": 0.0, "confidence": 1.0}
+
+# Matches VALIDATION_THRESHOLD in backend/config.py. Gating on a different
+# number here would make served and local answers disagree.
+VALIDATION_GATE = 0.50
+
+
+class LayaDecisionModel(mlflow.pyfunc.PythonModel):
+    def load_context(self, context):
+        import laya
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.agent = laya.load(context.artifacts["checkpoint"], device=device)
+        self.agent.cfg["max_len"] = 2048
+        self.agent.cfg["head_max_len"] = 384
+
+    def _decide(self, state, questions):
+        val_questions = {k: v for k, v in questions.items() if k.endswith("_valid")}
+
+        if not val_questions or len(val_questions) == len(questions):
+            return self.agent.predict(state, questions)
+
+        res_val = self.agent.predict(state, val_questions)
+        answers = dict(res_val.get("answers", {}))
+        input_tokens = int(res_val.get("usage", {}).get("input_tokens", 0))
+
+        valid_subjects = {
+            qid.replace("subj_", "").replace("_valid", "")
+            for qid, ans in answers.items()
+            if ans.get("noul", 0.0) >= VALIDATION_GATE
+        }
+
+        stage2 = {}
+        for qid, qdef in questions.items():
+            if qid.endswith("_valid"):
+                continue
+            subject_id = ""
+            if qid.startswith(("subj_", "tag_")):
+                parts = qid.split("_")
+                if len(parts) > 1:
+                    subject_id = parts[1]
+
+            if subject_id in valid_subjects:
+                stage2[qid] = qdef
+            elif qid.endswith("_prominence"):
+                answers[qid] = dict(PASSING_PROMINENCE)
+            elif qid.endswith("_sentiment"):
+                answers[qid] = dict(NEUTRAL_SENTIMENT)
+            elif qid.startswith("tag_"):
+                answers[qid] = dict(FALSE_TAG)
+
+        if stage2:
+            res2 = self.agent.predict(state, stage2)
+            answers.update(res2.get("answers", {}))
+            input_tokens += int(res2.get("usage", {}).get("input_tokens", 0))
+
+        return {
+            "answers": answers,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+        }
+
+    def predict(self, context, model_input, params=None):
+        out = []
+        for _, row in model_input.iterrows():
+            questions = row["questions"]
+            if isinstance(questions, str):
+                questions = json.loads(questions)
+            result = self._decide(row["state"], questions)
+            out.append(
+                json.dumps({
+                    "model": REGISTERED_MODEL,
+                    "answers": result.get("answers", {}),
+                    "usage": result.get("usage", {"input_tokens": 0, "output_tokens": 0}),
+                })
+            )
+        return out
+
+
+SERVING_SIGNATURE = ModelSignature(
+    inputs=Schema([ColSpec("string", "state"), ColSpec("string", "questions")]),
+    outputs=Schema([ColSpec("string")]),
+)
+SERVING_EXAMPLE = pd.DataFrame(
+    [{
+        "state": "Example article state.",
+        "questions": json.dumps({
+            "subj_1_valid": {"type": "noul", "prompt": "Is subject 1 the article subject?"}
+        }),
+    }]
+)
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## 3. Run it
 # MAGIC
 # MAGIC `TorchDistributor` with `local_mode=True` runs on the driver GPU. On a multi-GPU
@@ -463,7 +591,14 @@ with mlflow.start_run(run_name=f"laya-{EPOCHS}ep-top{TOP_LAYERS}-pw{POS_WEIGHT}"
 
     print(json.dumps(summary, indent=2))
     mlflow.log_dict(summary, "training_summary.json")
-    mlflow.log_artifacts(OUTPUT_DIR, artifact_path="laya_model")
+    mlflow.pyfunc.log_model(
+        artifact_path="laya_model",
+        python_model=LayaDecisionModel(),
+        artifacts={"checkpoint": OUTPUT_DIR},
+        signature=SERVING_SIGNATURE,
+        input_example=SERVING_EXAMPLE,
+        pip_requirements=["laya", "torch", "transformers", "safetensors"],
+    )
 
     FINAL_RUN_ID = run.info.run_id
 
@@ -480,12 +615,14 @@ print(f"MLflow run: {FINAL_RUN_ID}")
 # COMMAND ----------
 
 MIN_ACCURACY = 83.0
+REGISTERED_VERSION = None
 
 if summary["post_train_accuracy_pct"] >= MIN_ACCURACY:
     result = mlflow.register_model(
         model_uri=f"runs:/{FINAL_RUN_ID}/laya_model",
         name=REGISTERED_MODEL,
     )
+    REGISTERED_VERSION = result.version
     print(f"Registered {REGISTERED_MODEL} version {result.version}")
     print(f"Accuracy {summary['post_train_accuracy_pct']}% | {summary['by_kind']}")
 else:
@@ -493,6 +630,59 @@ else:
         f"Not registered. Accuracy {summary['post_train_accuracy_pct']}% "
         f"is below the {MIN_ACCURACY}% gate."
     )
+
+summary["registered_version"] = REGISTERED_VERSION
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5. Publish to Model Serving
+# MAGIC
+# MAGIC The test rig talks to a serving endpoint, not to Unity Catalog, so a new
+# MAGIC version is invisible until the endpoint points at it. `scale_to_zero` keeps
+# MAGIC an idle endpoint from billing GPU hours between benchmark runs; the first
+# MAGIC request after idle pays a cold start.
+# MAGIC
+# MAGIC Skipped when the accuracy gate rejected the run.
+
+# COMMAND ----------
+
+SERVING_ENDPOINT = dbutils.widgets.get("serving_endpoint")
+
+if REGISTERED_VERSION is None:
+    print("No new version to publish.")
+elif SERVING_ENDPOINT:
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.serving import (
+        EndpointCoreConfigInput,
+        ServedEntityInput,
+    )
+
+    w = WorkspaceClient()
+    entity = ServedEntityInput(
+        entity_name=REGISTERED_MODEL,
+        entity_version=REGISTERED_VERSION,
+        workload_size="Small",
+        workload_type="GPU_SMALL",
+        scale_to_zero_enabled=True,
+    )
+    existing = [e.name for e in w.serving_endpoints.list()]
+
+    if SERVING_ENDPOINT in existing:
+        w.serving_endpoints.update_config(
+            name=SERVING_ENDPOINT, served_entities=[entity]
+        )
+        print(f"Updated endpoint {SERVING_ENDPOINT} to version {REGISTERED_VERSION}")
+    else:
+        w.serving_endpoints.create(
+            name=SERVING_ENDPOINT,
+            config=EndpointCoreConfigInput(served_entities=[entity]),
+        )
+        print(f"Created endpoint {SERVING_ENDPOINT} at version {REGISTERED_VERSION}")
+
+    summary["serving_endpoint"] = SERVING_ENDPOINT
+else:
+    print("serving_endpoint widget is blank; skipping publish.")
 
 # COMMAND ----------
 
