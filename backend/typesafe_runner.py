@@ -133,6 +133,50 @@ class TypeSafeRunner:
 
         return await self._evaluate_jev(state, questions, target_model)
 
+    # Transient DNS and connection failures cost a whole article otherwise: one
+    # resolver hiccup under concurrent load and the run records it as failed.
+    # The Jev path already retries; the Laya paths did not.
+    RETRYABLE_STATUS = (429, 500, 502, 503, 504, 520, 521, 522, 524)
+    MAX_RETRIES = 3
+
+    async def _post_with_retry(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+    ) -> Any:
+        client = self._get_client()
+        last_error: Exception | None = None
+
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code in self.RETRYABLE_STATUS and attempt < self.MAX_RETRIES:
+                    wait_sec = (attempt + 1) * 2.0
+                    logger.warning(
+                        f"Laya endpoint {resp.status_code} on attempt {attempt + 1}, "
+                        f"retrying in {wait_sec}s..."
+                    )
+                    await asyncio.sleep(wait_sec)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.ConnectError) as net_err:
+                last_error = net_err
+                if attempt < self.MAX_RETRIES:
+                    wait_sec = (attempt + 1) * 2.0
+                    logger.warning(
+                        f"Laya endpoint network error on attempt {attempt + 1}: "
+                        f"{net_err!r}, retrying in {wait_sec}s..."
+                    )
+                    await asyncio.sleep(wait_sec)
+                    continue
+                raise
+
+        raise RuntimeError(
+            f"Laya endpoint exhausted {self.MAX_RETRIES} retries: {last_error!r}"
+        )
+
     async def _evaluate_laya_remote(
         self,
         engine: str,
@@ -159,10 +203,7 @@ class TypeSafeRunner:
             "Authorization": f"Bearer {transport['api_key']}",
             "Content-Type": "application/json",
         }
-        client = self._get_client()
-        resp = await client.post(transport["url"], json=payload, headers=headers)
-        resp.raise_for_status()
-        raw = resp.json()
+        raw = await self._post_with_retry(transport["url"], payload, headers)
         data = self._unwrap_mlflow(raw) if transport["protocol"] == "mlflow" else raw
 
         duration_ms = (time.perf_counter() - t0) * 1000.0
@@ -334,11 +375,8 @@ class TypeSafeRunner:
                 ]
             }
 
-        client = self._get_client()
         t0 = time.perf_counter()
-        resp = await client.post(transport["batch_url"], json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+        data = await self._post_with_retry(transport["batch_url"], payload, headers)
         total_dur = (time.perf_counter() - t0) * 1000.0
         per_item_dur = round(total_dur / max(1, len(batch_items)), 2)
 
