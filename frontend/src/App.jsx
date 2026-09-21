@@ -399,6 +399,10 @@ export default function App() {
 
   // The model string is the source of truth. The backend resolves the engine
   // from it, so the provider only needs to disambiguate the Laya variants.
+  // Backend sends null when nothing was evaluated. Rendering that as "null%" or
+// falling back to 100% both lie about a run where every article failed.
+const pctLabel = v => (v === null || v === undefined ? 'n/a' : `${v}%`);
+
   const providerFor = model => {
     if (model.startsWith('laya:databricks:local')) return 'laya_local';
     if (model.startsWith('laya:databricks')) return 'laya_databricks';
@@ -750,7 +754,6 @@ export default function App() {
                   </optgroup>
                   <optgroup label="Cloud API">
                     <option value="typesafe/jev-1.13">TypeSafe Jev (OpenRouter Cloud)</option>
-                    <option value="jev-latest">TypeSafe Jev (Direct Cloud)</option>
                   </optgroup>
                 </select>
               </div>
@@ -931,26 +934,26 @@ export default function App() {
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   <StatCard
                     label="Subject Validation"
-                    value={`${summary.accuracy.subject_validation.accuracy_pct}%`}
+                    value={pctLabel(summary.accuracy.subject_validation.accuracy_pct)}
                     sub={`(${summary.accuracy.subject_validation.correct}/${summary.accuracy.subject_validation.total})`}
                     icon={<CheckCircle2 className="w-4 h-4 text-emerald-500" />}
                     tone="emerald"
                   />
                   <StatCard
                     label="Prominence Match"
-                    value={`${summary.accuracy.subject_prominence.accuracy_pct}%`}
+                    value={pctLabel(summary.accuracy.subject_prominence.accuracy_pct)}
                     sub={`(${summary.accuracy.subject_prominence.correct}/${summary.accuracy.subject_prominence.total})`}
                     icon={<TrendingUp className="w-4 h-4 text-blue-500" />}
                   />
                   <StatCard
                     label="Sentiment Match"
-                    value={`${summary.accuracy.subject_sentiment.accuracy_pct}%`}
+                    value={pctLabel(summary.accuracy.subject_sentiment.accuracy_pct)}
                     sub={`(${summary.accuracy.subject_sentiment.correct}/${summary.accuracy.subject_sentiment.total})`}
                     icon={<TrendingUp className="w-4 h-4 text-blue-500" />}
                   />
                   <StatCard
                     label="LLM Tags Match"
-                    value={`${summary.accuracy.llm_tags.accuracy_pct}%`}
+                    value={pctLabel(summary.accuracy.llm_tags.accuracy_pct)}
                     sub={`(${summary.accuracy.llm_tags.correct}/${summary.accuracy.llm_tags.total})`}
                     icon={<CheckCircle2 className="w-4 h-4 text-emerald-500" />}
                   />

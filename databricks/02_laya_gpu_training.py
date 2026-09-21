@@ -742,7 +742,6 @@ with mlflow.start_run(run_name=f"laya-{EPOCHS}ep-top{TOP_LAYERS}-pw{POS_WEIGHT}"
         python_model=LayaDecisionModel(),
         artifacts={"checkpoint": OUTPUT_DIR},
         signature=SERVING_SIGNATURE,
-        input_example=SERVING_EXAMPLE,
         pip_requirements=["laya", "torch", "transformers", "safetensors"],
     )
 
@@ -802,6 +801,7 @@ elif SERVING_ENDPOINT:
     from databricks.sdk.service.serving import (
         EndpointCoreConfigInput,
         ServedEntityInput,
+        ServingModelWorkloadType,
     )
 
     w = WorkspaceClient()
@@ -809,7 +809,7 @@ elif SERVING_ENDPOINT:
         entity_name=REGISTERED_MODEL,
         entity_version=REGISTERED_VERSION,
         workload_size="Small",
-        workload_type="GPU_SMALL",
+        workload_type=ServingModelWorkloadType.GPU_SMALL,
         scale_to_zero_enabled=True,
     )
     existing = [e.name for e in w.serving_endpoints.list()]

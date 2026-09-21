@@ -131,11 +131,6 @@ def list_providers():
                 "name": "OpenRouter Jev (Proxy Cloud API)",
                 "models": [{"id": "typesafe/jev-1.13", "name": "typesafe/jev-1.13"}],
             },
-            {
-                "id": "typesafe",
-                "name": "TypeSafe Jev (Direct Cloud API)",
-                "models": [{"id": "jev-latest", "name": "jev-latest"}],
-            },
         ],
     }
 @app.get("/api/configs")
@@ -664,7 +659,11 @@ async def execute_benchmark_task(
         ]
         await asyncio.gather(*tasks)
 
-        summary = run_logger.finalize_run(job_id, comparisons)
+        summary = run_logger.finalize_run(
+            job_id,
+            comparisons,
+            failed_articles=len(ACTIVE_JOBS[job_id].get("failed_blobs", [])),
+        )
         ACTIVE_JOBS[job_id]["status"] = "completed"
         ACTIVE_JOBS[job_id]["summary"] = summary
         ACTIVE_JOBS[job_id]["comparisons"] = comparisons

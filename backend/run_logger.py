@@ -46,7 +46,12 @@ class RunLogger:
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(comparison, f, indent=2, default=str)
 
-    def finalize_run(self, run_id: str, comparisons: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def finalize_run(
+        self,
+        run_id: str,
+        comparisons: List[Dict[str, Any]],
+        failed_articles: int = 0,
+    ) -> Dict[str, Any]:
         run_folder = os.path.join(self.runs_dir, run_id)
         total_articles = len(comparisons)
 
@@ -106,9 +111,10 @@ class RunLogger:
         ) if total_jev_cost > 0 else None
         cost_multiple = round(total_llm_cost / total_jev_cost, 1) if total_jev_cost > 0 else None
 
-        def pct(correct: int, total: int) -> float:
-            # No evaluated items means nothing disagreed; do not report a false 0%.
-            return round((correct / total) * 100.0, 1) if total > 0 else 100.0
+        def pct(correct: int, total: int) -> float | None:
+            # Nothing evaluated is not the same as everything correct. A run whose
+            # articles all failed used to report 100%, which reads as a pass.
+            return round((correct / total) * 100.0, 1) if total > 0 else None
 
         val_acc = pct(val_correct, val_total)
         prom_acc = pct(prom_correct, prom_total)
@@ -140,6 +146,9 @@ class RunLogger:
             "run_id": run_id,
             "completed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "total_articles": total_articles,
+            "failed_articles": failed_articles,
+            # A run is only meaningful if something was actually evaluated.
+            "evaluated": total_articles > 0,
             "accuracy": {
                 "subject_validation": {
                     "accuracy_pct": val_acc,

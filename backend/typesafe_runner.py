@@ -201,11 +201,16 @@ class TypeSafeRunner:
                 "User-Agent": settings.OPENROUTER_USER_AGENT or settings.OPENROUTER_APP_TITLE,
             }
         else:
-            endpoint = f"{self.api_base.rstrip('/')}/api/alpha/decisions"
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            }
+            # The direct TypeSafe provider has never worked: the original code
+            # assigned `endpoint` only on the OpenRouter branch, so this path
+            # raised NameError. Every plausible URL under TYPESAFE_API_BASE
+            # returns 404, so there is nothing to point it at. Fail with a
+            # message that says so rather than posting into the void.
+            raise RuntimeError(
+                f"JEV_PROVIDER={self.provider!r} has no working endpoint. "
+                "Set JEV_PROVIDER=openrouter, or supply the real direct-API "
+                "path before using this provider."
+            )
 
         payload = {
             "state": state,
