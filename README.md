@@ -1,8 +1,8 @@
 # jev-curation-engine
 
-A read-only feasibility test rig for benchmarking System 1 non-autoregressive decision models—**TypeSafe Jev** (Cloud API) and **Laya** (Self-Hosted ModernBERT on Azure GPU)—against the Curation Engine's existing production LLM classification results.
+A read-only feasibility test rig for benchmarking System 1 non-autoregressive decision models against the Curation Engine's existing production LLM classification results. Three System 1 engines are selectable: **TypeSafe Jev** (Cloud API), **Laya on Azure GPU** (self-hosted ModernBERT), and **Laya on Databricks** (Model Serving endpoint or locally downloaded weights).
 
-The platform reads published Curation Engine configuration snapshots from Azure MySQL, discovers processed articles through `pipeline_audit_log`, fetches exact audit blobs from Azure Blob Storage, evaluates structured classification decisions across the chosen engine (Laya or Jev), and records side-by-side benchmark, cost, and latency comparisons.
+The platform reads published Curation Engine configuration snapshots from Azure MySQL, discovers processed articles through `pipeline_audit_log`, fetches exact audit blobs from Azure Blob Storage, evaluates structured classification decisions across the chosen engine, and records side-by-side benchmark, cost, and latency comparisons.
 
 ## What it measures
 
@@ -17,16 +17,29 @@ Boolean tags remain local deterministic evaluations. The rig does not ask Jev or
 
 ## Model Tiers & Decision Engines
 
-The platform supports three distinct evaluation tiers:
+The platform supports these evaluation tiers:
 
 1. **Baseline LLM (Production Reference)**: Generative cloud models (GPT-4 / Claude / Gemini) executing unstructured classification prompts as currently deployed in production.
 2. **TypeSafe Jev (Cloud API)**: Managed typed-decision API running non-autoregressive primitives (`choice`, `score`, `noul`) via cloud inference.
 3. **Laya (Self-Hosted on Azure GPU)**: Dedicated open-weight bidirectional encoder backbone (**ModernBERT-large**, 421M parameters) fine-tuned on Curation Engine production audit data and deployed on dedicated Azure hardware.
+4. **Laya (Databricks)**: The same architecture trained on the `muckrack-data` Databricks workspace and served two ways, either from a Model Serving GPU endpoint or from weights pulled out of Unity Catalog and run locally on Apple MPS. See [Laya on Databricks](#laya-on-databricks) below.
+
+The model string in the **Decision Engine** dropdown is the source of truth for routing. `TypeSafeRunner._resolve_engine` maps it to an engine, and the `provider` field only disambiguates the Laya variants.
+
+| Dropdown value | Engine | Where it runs |
+| :--- | :--- | :--- |
+| `laya:azure:t4` | `laya_azure` | `dev-002` in uksouth |
+| `laya:databricks` | `laya_databricks` | Databricks Model Serving |
+| `laya:databricks:local` | `laya_local` | `runs/laya_databricks` on local MPS |
+| `jev-latest`, `typesafe/jev-1.13` | `jev` | TypeSafe or OpenRouter |
+
 ## Repository layout
 
 ```text
 backend/                 FastAPI service and benchmark engine
 frontend/                React/Vite dashboard
+databricks/              Spark sequence prep and GPU training notebooks, cluster spec
+scripts/                 Operational scripts, including Unity Catalog model download
 ce-blobstore-logs/       Curation Engine archive and database integration contracts
 type-safe-docs/           TypeSafe Jev reference material
 runs/                    Local benchmark output, ignored by Git
@@ -89,13 +102,19 @@ flowchart TD
         direction TB
         ENGINE{Decision Engine Selector}
         LAYA["Laya: Azure Tesla T4 GPU<br/>(Self-Hosted ModernBERT-large 421M)"]
+        DBX["Laya: Databricks Model Serving<br/>(MLflow pyfunc, scale-to-zero GPU)"]
+        DBXL["Laya: Databricks Weights<br/>(local MPS, runs/laya_databricks)"]
         JEV["TypeSafe Jev: Cloud API<br/>(OpenRouter / Direct Cloud)"]
-        ENGINE -->|Default / Self-Hosted| LAYA
-        ENGINE -->|Cloud API| JEV
+        ENGINE -->|"laya:azure:t4"| LAYA
+        ENGINE -->|"laya:databricks"| DBX
+        ENGINE -->|"laya:databricks:local"| DBXL
+        ENGINE -->|"jev-latest"| JEV
     end
 
     API --> ENGINE
     LAYA --> COMP[Side-by-Side Comparator]
+    DBX --> COMP
+    DBXL --> COMP
     JEV --> COMP
     BLOB --> COMP
     COMP --> RUNS[(runs/run_id<br/>JSON & Markdown)]
@@ -222,6 +241,119 @@ During model comparison reviews evaluated by **Gemini 3.8 Flash**, several criti
 | **Validation Match Accuracy**| Reference (100%) | 86.1% | **93.4%** |
 | **Gemini 3.8 Arbitration** | 25.0% preference | N/A | **75.0% preference (3:1 win rate over baseline)** |
 | **Production Readiness** | Current Production | Feasibility Reference | **CONDITIONAL GO FOR PRODUCTION** |
+## Laya on Databricks
+
+Training moved off the single Azure Tesla T4 VM (`dev-002`) and onto the `muckrack-data` workspace so that data preparation runs distributed on Spark and training runs on a rented GPU rather than a permanently provisioned one. Full setup, secrets, and runbook are in [`databricks/README.md`](databricks/README.md).
+
+### 1. Workspace and assets
+
+| Item | Value |
+| :--- | :--- |
+| Workspace | `https://dbc-34034be3-652f.cloud.databricks.com` |
+| Catalog / schema | `muckrack_data.laya` |
+| Notebooks | `/Users/tony.prime@muckrack.com/laya_curation_engine/` |
+| Training cluster | `laya-gpu-training`, single-node `g5.xlarge` (A10G, 24 GB), 45 min autotermination |
+| Gold table | `muckrack_data.laya.training_sequences` |
+| Registered model | `muckrack_data.laya.laya_typed_decisions` |
+| Serving endpoint | `laya-curation-engine`, created with scale-to-zero |
+
+### 2. Training pipeline
+
+```mermaid
+flowchart TD
+    BLOB[(Azure Blob Storage<br/>pipeline-audit container)]
+    CFG[(Config snapshots<br/>UC volume)]
+
+    subgraph NB1["01_laya_sequence_prep (CPU cluster)"]
+        direction TB
+        AL[Auto Loader incremental ingest<br/>checkpointed, bounded by maxFilesPerTrigger]
+        BRONZE[(bronze_audit_blobs)]
+        BC[Broadcast config snapshots<br/>convert_config_to_questions]
+        TOK[Spark UDF tokenization<br/>typed-decision sequences]
+        BAL[Rebalance tag class<br/>tag_pos_ratio default 50/50]
+        SPLIT[Split hashed on correlation_id<br/>85 train / 15 val]
+        AL --> BRONZE --> BC --> TOK --> BAL --> SPLIT
+    end
+
+    subgraph NB2["02_laya_gpu_training (laya-gpu-training)"]
+        direction TB
+        FT[Fine-tune ModernBERT-large<br/>3 epochs, top 8 layers, pos_weight 2.5]
+        EVAL{"Accuracy >= 83% gate"}
+        PYF[Log MLflow pyfunc<br/>reproduces two-stage gating]
+        UC[(Unity Catalog<br/>registered model version)]
+        FT --> EVAL
+        EVAL -->|pass| PYF --> UC
+        EVAL -->|fail| STOP[Not registered]
+    end
+
+    BLOB --> AL
+    CFG --> BC
+    SPLIT --> GOLD[(training_sequences)]
+    GOLD --> FT
+    UC --> SERVE[Model Serving endpoint<br/>laya-curation-engine]
+    UC --> PULL[scripts/fetch_databricks_model.py<br/>runs/laya_databricks]
+    SERVE --> RIG[Test rig Decision Engine]
+    PULL --> RIG
+```
+
+### 3. Why the training settings differ from the Azure run
+
+The Azure model hedged on tags. True tags came back at p=0.30 to 0.50 and never cleared the decision threshold, which is why the rig showed almost every tag as false. Three causes, each addressed in the notebooks:
+
+* **Base rate learned instead of criteria**: tags were sampled at the production ratio of roughly 85% negative. Notebook 01 downsamples the negatives to the `tag_pos_ratio` widget, default 50/50.
+* **Undertrained**: only one epoch ran, 1,098 optimizer steps across 274 client configurations. Notebook 02 runs three epochs over the top 8 encoder layers.
+* **Symmetric loss**: a missed positive and a missed negative cost the same. Notebook 02 weights the positive class on `noul` heads by `pos_weight`, default 2.5.
+
+The train/validation split is now hashed on `correlation_id` rather than sampled per row. The Azure split put sequences from the same article on both sides, so the 83.33% reported for that run is measured more loosely than the Databricks figures will be, and the two are not directly comparable.
+
+### 4. Serving and routing
+
+Notebook 02 logs an MLflow `pyfunc` rather than a bare artifact directory. A bare directory registers but cannot be invoked, so the rig would have nothing to call. The wrapper reproduces the two-stage gating in `backend/laya_runner.py`: validation questions run first, and prominence, sentiment, and tag questions are only asked about subjects that passed. Subjects that fail receive the same hard-coded defaults the local runner applies, so a served answer and a local answer agree for the same input. The response envelope matches the Azure service, which is what lets the rig treat all three as interchangeable engines.
+
+```mermaid
+sequenceDiagram
+    participant UI as React Dashboard
+    participant API as FastAPI Backend
+    participant TR as TypeSafeRunner
+    participant DBX as Databricks Model Serving
+    UI->>API: POST /api/benchmark (model=laya:databricks)
+    API->>TR: evaluate_article
+    TR->>TR: _resolve_engine reads model string
+    TR->>DBX: MLflow scoring request (validation questions)
+    DBX-->>TR: noul probabilities
+    TR->>DBX: prominence, sentiment, tags for passing subjects
+    DBX-->>TR: choice distributions and tag probabilities
+    TR-->>API: normalized decision envelope
+    API-->>UI: side-by-side comparison
+```
+
+Routing order matters: `laya:databricks:local` is checked before `laya:databricks` because one is a prefix of the other.
+
+### 5. Configuration
+
+The Model Serving engine needs three values in the repo-root `.env`. `GET /api/providers` reports `configured: true` once they resolve.
+
+```text
+DATABRICKS_HOST=https://dbc-34034be3-652f.cloud.databricks.com
+DATABRICKS_TOKEN=<PAT or service-principal token>
+LAYA_DATABRICKS_ENDPOINT=laya-curation-engine
+```
+
+The local-weights engine needs no credentials beyond a one-off download:
+
+```bash
+uv run python scripts/fetch_databricks_model.py            # latest version
+uv run python scripts/fetch_databricks_model.py --version 4
+```
+
+That writes `runs/laya_databricks/`, which `backend/laya_runner.py` resolves by name. It avoids both the endpoint cold start and a network hop per decision, so it is the better option when iterating on thresholds.
+
+### 6. Known gaps
+
+* Notebook 01 inlines the question-building logic from `backend/question_converter.py` so the cluster does not need the repo. It will drift when the backend prompts change. Packaging `backend/` as a wheel and importing it is the durable fix.
+* Audit blobs are read cross-cloud from Azure on every run. Staging them into a Unity Catalog volume removes the egress once the pipeline is scheduled.
+* `.limit(PARSE_LIMIT)` in notebook 01 collapses the sample to one partition, so tokenization runs single-threaded. A `.repartition()` after the limit would use all cores on the node.
+
 ## Important limitations
 
 This is a feasibility tool, not a production replacement service.
