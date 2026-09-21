@@ -153,7 +153,16 @@ def evaluate(model, items, pad_token_id, device, batch_size=16, max_items=600):
     from laya.common import collate_items
 
     model.eval()
-    subset = items[:max_items]
+
+    # Stratify. `items[:max_items]` drew only tags, because the sequences come
+    # back grouped by decision_kind, so every reported accuracy was tag-only
+    # while claiming to cover all four kinds - and the registration gate was
+    # judged on it. Take an even share of each kind instead.
+    by_kind = {}
+    for it in items:
+        by_kind.setdefault(it["decision_kind"], []).append(it)
+    per_kind = max(1, max_items // max(1, len(by_kind)))
+    subset = [it for kind_items in by_kind.values() for it in kind_items[:per_kind]]
     correct_by_kind, total_by_kind = {}, {}
     total_loss, n_batches = 0.0, 0
     logits_by_type = {0: [], 1: [], 2: []}
@@ -377,6 +386,9 @@ def _train_impl():
 
         step_count = 0
         t_start = time.perf_counter()
+        best_val_loss = float("inf")
+        best_epoch = None
+        best_state = None
 
         for epoch in range(epochs):
             random.seed(42 + epoch)
@@ -456,6 +468,18 @@ def _train_impl():
                 mlflow.log_metric("epoch_val_loss", epoch_eval["loss"], step=epoch + 1)
                 for kind, acc in epoch_eval["by_kind"].items():
                     mlflow.log_metric(f"epoch_val_accuracy_{kind}", acc, step=epoch + 1)
+
+                # Keep the best epoch, not the last one. Validation loss rose
+                # after epoch 1 on the first real run while training loss kept
+                # falling, so saving final weights published a model the run
+                # had already beaten.
+                if epoch_eval["loss"] < best_val_loss:
+                    best_val_loss = epoch_eval["loss"]
+                    best_epoch = epoch + 1
+                    best_state = {
+                        k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()
+                    }
+                    logger.info(f"New best epoch {best_epoch} (val loss {best_val_loss:.4f})")
             model.train()
 
             # Non-chief ranks must not race ahead into the next epoch while the
@@ -471,6 +495,10 @@ def _train_impl():
             return None
 
         logger.info(f"Training finished in {duration / 60:.1f} min")
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+            logger.info(f"Restored epoch {best_epoch} (val loss {best_val_loss:.4f}) for saving")
 
         post = evaluate(model, val_items, tok.pad_token_id, device)
         logger.info(f"Post-training accuracy: {post['overall_accuracy_pct']}% | {post['by_kind']}")
@@ -508,6 +536,8 @@ def _train_impl():
             "training_minutes": round(duration / 60, 2),
             "output_dir": output_dir,
             "world_size": world_size,
+            "best_epoch": best_epoch,
+            "best_val_loss": round(best_val_loss, 4),
         }
 
     if is_distributed:
