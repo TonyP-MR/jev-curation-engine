@@ -32,3 +32,5 @@ runs/
 .omp/
 .agents/
 _bmad/
+.claude/
+skills-lock.json
