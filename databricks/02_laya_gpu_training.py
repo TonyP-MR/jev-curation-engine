@@ -710,8 +710,14 @@ with mlflow.start_run(run_name=f"laya-{EPOCHS}ep-top{TOP_LAYERS}-pw{POS_WEIGHT}"
         "PYTHONPATH": (
             f"{TRAIN_FN_DIR}:{inherited_path}" if inherited_path else TRAIN_FN_DIR
         ),
-        # Auth for the child ranks is inherited from the driver environment.
-        # If rank 0 cannot reach MLflow, rank_0.log will say so.
+        # Rank 0 logs to the chief's MLflow run from a child interpreter, which
+        # has none of the notebook's ambient Databricks auth. Without these the
+        # run dies in get_databricks_host_creds.
+        "DATABRICKS_HOST": f"https://{spark.conf.get('spark.databricks.workspaceUrl')}",
+        "DATABRICKS_TOKEN": (
+            dbutils.notebook.entry_point.getDbutils()
+            .notebook().getContext().apiToken().get()
+        ),
     })
 
     import sys
