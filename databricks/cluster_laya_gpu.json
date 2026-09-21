@@ -1,0 +1,27 @@
+{
+  "cluster_name": "laya-gpu-training",
+  "spark_version": "17.3.x-gpu-ml-scala2.13",
+  "node_type_id": "g5.xlarge",
+  "driver_node_type_id": "g5.xlarge",
+  "num_workers": 0,
+  "autotermination_minutes": 45,
+  "data_security_mode": "SINGLE_USER",
+  "runtime_engine": "STANDARD",
+  "spark_conf": {
+    "spark.master": "local[*, 4]",
+    "spark.databricks.cluster.profile": "singleNode"
+  },
+  "custom_tags": {
+    "ResourceClass": "SingleNode",
+    "project": "laya-curation-engine",
+    "purpose": "gpu-finetuning"
+  },
+  "aws_attributes": {
+    "availability": "ON_DEMAND",
+    "first_on_demand": 1,
+    "zone_id": "auto",
+    "ebs_volume_type": "GENERAL_PURPOSE_SSD",
+    "ebs_volume_count": 1,
+    "ebs_volume_size": 200
+  }
+}

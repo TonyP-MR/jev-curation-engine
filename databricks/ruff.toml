@@ -1,0 +1,5 @@
+# Databricks notebooks run against the cluster runtime, which injects `spark`,
+# `dbutils`, and `display` as globals. Ruff cannot see them, so F821 fires on
+# every use. The notebooks are not imported by anything in `backend/`.
+[lint]
+ignore = ["F821"]
