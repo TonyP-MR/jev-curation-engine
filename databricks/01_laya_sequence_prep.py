@@ -42,6 +42,8 @@ dbutils.widgets.text("config_path", "/Volumes/muckrack_data/laya/configs", "Conf
 dbutils.widgets.text("catalog", "muckrack_data", "Catalog")
 dbutils.widgets.text("schema", "laya", "Schema")
 dbutils.widgets.text("blobs_limit", "0", "Blob limit (0 = all)")
+dbutils.widgets.text("parse_limit", "0", "Blobs to parse from bronze (0 = all)")
+dbutils.widgets.dropdown("skip_ingest", "false", ["true", "false"], "Skip ingest, reuse bronze")
 dbutils.widgets.text("tag_pos_ratio", "0.5", "Target positive tag ratio")
 
 SOURCE_MODE = dbutils.widgets.get("source_mode")
@@ -52,6 +54,8 @@ CONFIG_PATH = dbutils.widgets.get("config_path")
 CATALOG = dbutils.widgets.get("catalog")
 SCHEMA = dbutils.widgets.get("schema")
 BLOBS_LIMIT = int(dbutils.widgets.get("blobs_limit"))
+PARSE_LIMIT = int(dbutils.widgets.get("parse_limit"))
+SKIP_INGEST = dbutils.widgets.get("skip_ingest") == "true"
 TAG_POS_RATIO = float(dbutils.widgets.get("tag_pos_ratio"))
 
 BRONZE_BLOBS = f"{CATALOG}.{SCHEMA}.bronze_audit_blobs"
@@ -97,49 +101,53 @@ from pyspark.sql import functions as F
 CHECKPOINT = f"/Volumes/{CATALOG}/{SCHEMA}/checkpoints/bronze_audit_blobs"
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMA}.checkpoints")
 
-stream = (
-    spark.readStream.format("cloudFiles")
-    .option("cloudFiles.format", "text")
-    .option("cloudFiles.schemaLocation", f"{CHECKPOINT}/schema")
-    .option("wholetext", "true")
-    .option("pathGlobFilter", "*.json")
-)
-
-if BLOBS_LIMIT > 0:
-    stream = stream.option("cloudFiles.maxFilesPerTrigger", str(BLOBS_LIMIT))
-
-raw_blobs = (
-    stream.load(blob_source)
-    .select(
-        F.col("value").alias("payload"),
-        F.col("_metadata.file_path").alias("source_path"),
-        F.col("_metadata.file_modification_time").alias("ingested_at"),
-    )
-)
-
-# `availableNow` drains what is currently there and stops, honouring
-# maxFilesPerTrigger as a per-batch cap. A bounded smoke run uses one batch.
-query = (
-    raw_blobs.writeStream
-    .option("checkpointLocation", f"{CHECKPOINT}/state")
-    .trigger(availableNow=True)
-    .toTable(BRONZE_BLOBS)
-)
-
-if BLOBS_LIMIT > 0:
-    # Stop after the first batch so a smoke run does not drain the container.
-    import time
-    while query.isActive:
-        if query.recentProgress and sum(p["numInputRows"] for p in query.recentProgress) >= BLOBS_LIMIT:
-            query.stop()
-            break
-        time.sleep(2)
-    query.awaitTermination()
+if SKIP_INGEST:
+    blob_count = spark.table(BRONZE_BLOBS).count()
+    print(f"Skipping ingest. {BRONZE_BLOBS} already holds {blob_count} blobs.")
 else:
+    stream = (
+        spark.readStream.format("cloudFiles")
+        .option("cloudFiles.format", "text")
+        .option("cloudFiles.schemaLocation", f"{CHECKPOINT}/schema")
+        .option("wholetext", "true")
+        .option("pathGlobFilter", "*.json")
+    )
+
+    if BLOBS_LIMIT > 0:
+        stream = stream.option("cloudFiles.maxFilesPerTrigger", str(BLOBS_LIMIT))
+
+    raw_blobs = (
+        stream.load(blob_source)
+        .select(
+            F.col("value").alias("payload"),
+            F.col("_metadata.file_path").alias("source_path"),
+            F.col("_metadata.file_modification_time").alias("ingested_at"),
+        )
+    )
+
+    # `availableNow` drains what is currently there and stops, honouring
+    # maxFilesPerTrigger as a per-batch cap. A bounded run uses one batch.
+    query = (
+        raw_blobs.writeStream
+        .option("checkpointLocation", f"{CHECKPOINT}/state")
+        .trigger(availableNow=True)
+        .toTable(BRONZE_BLOBS)
+    )
+
+    if BLOBS_LIMIT > 0:
+        # Stop after the first batch so a bounded run does not drain the
+        # container. It holds millions of blobs; draining it is never wanted.
+        import time
+        while query.isActive:
+            seen = sum(p["numInputRows"] for p in query.recentProgress or [])
+            if seen >= BLOBS_LIMIT:
+                query.stop()
+                break
+            time.sleep(2)
     query.awaitTermination()
 
-blob_count = spark.table(BRONZE_BLOBS).count()
-print(f"Ingested {blob_count} audit blobs into {BRONZE_BLOBS}")
+    blob_count = spark.table(BRONZE_BLOBS).count()
+    print(f"Ingested {blob_count} audit blobs into {BRONZE_BLOBS}")
 
 # COMMAND ----------
 
@@ -478,7 +486,15 @@ def build_sequences_partition(rows):
 
 # COMMAND ----------
 
-sequences_rdd = spark.table(BRONZE_BLOBS).rdd.mapPartitions(build_sequences_partition)
+# The bronze table accumulates across runs, and the source container holds
+# millions of blobs. Training set size is therefore a deliberate choice here,
+# not a side effect of how long ingestion was left running.
+bronze = spark.table(BRONZE_BLOBS)
+if PARSE_LIMIT > 0:
+    bronze = bronze.orderBy(F.rand(seed=17)).limit(PARSE_LIMIT)
+    print(f"Parsing a {PARSE_LIMIT}-blob sample of {BRONZE_BLOBS}")
+
+sequences_rdd = bronze.rdd.mapPartitions(build_sequences_partition)
 sequences = spark.createDataFrame(sequences_rdd, schema=SEQUENCE_SCHEMA).cache()
 
 print(f"Generated {sequences.count()} raw sequences")

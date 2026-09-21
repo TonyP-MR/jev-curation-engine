@@ -130,6 +130,7 @@ print(f"Staged tensors to {STAGING_DIR}")
 # COMMAND ----------
 
 train_fn_source = '''
+import contextlib
 import json
 import logging
 import os
@@ -138,6 +139,8 @@ import time
 
 import mlflow
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
@@ -248,23 +251,56 @@ def train():
     pos_weight = float(os.environ["LAYA_POS_WEIGHT"])
     run_id = os.environ["LAYA_MLFLOW_RUN_ID"]
 
-    device = torch.device("cuda")
+    # TorchDistributor launches this through torchrun, which sets these. Running
+    # the notebook with num_gpus=1 calls train() directly and they are absent.
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_distributed = world_size > 1
+    is_chief = rank == 0
+
+    if is_distributed:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cuda")
+
     train_items = torch.load(f"{staging_dir}/train_items.pt", weights_only=False)
     val_items = torch.load(f"{staging_dir}/val_items.pt", weights_only=False)
-    logger.info(f"Loaded {len(train_items)} train, {len(val_items)} val sequences")
 
-    base_agent = laya.load("convaiinnovations/laya", subfolder="typed-decisions", device="cuda")
+    # Every rank must take the same number of optimizer steps or NCCL deadlocks
+    # waiting for a gradient all-reduce that never arrives. Truncating to a
+    # common length costs at most world_size - 1 sequences per epoch.
+    if is_distributed:
+        per_rank = len(train_items) // world_size
+        shard_seed = 1234
+        random.Random(shard_seed).shuffle(train_items)
+        train_items = train_items[rank * per_rank:(rank + 1) * per_rank]
+
+    logger.info(
+        f"[rank {rank}/{world_size}] {len(train_items)} train, {len(val_items)} val sequences"
+    )
+
+    base_agent = laya.load(
+        "convaiinnovations/laya", subfolder="typed-decisions", device=str(device)
+    )
     model = base_agent.model
     model.to(device)
     tok = base_agent.tok
     cfg = dict(base_agent.cfg)
 
-    with mlflow.start_run(run_id=run_id):
-        pre = evaluate(model, val_items, tok.pad_token_id, device)
-        logger.info(f"Pre-training accuracy: {pre['overall_accuracy_pct']}% | {pre['by_kind']}")
-        mlflow.log_metric("pre_train_accuracy_pct", pre["overall_accuracy_pct"])
-        for kind, acc in pre["by_kind"].items():
-            mlflow.log_metric(f"pre_train_accuracy_{kind}", acc)
+    # Only the chief writes to MLflow. Four ranks logging the same metric names
+    # to one run interleaves their step counters into nonsense.
+    mlflow_ctx = mlflow.start_run(run_id=run_id) if is_chief else contextlib.nullcontext()
+
+    with mlflow_ctx:
+        pre = evaluate(model, val_items, tok.pad_token_id, device) if is_chief else None
+        if is_chief:
+            logger.info(f"Pre-training accuracy: {pre['overall_accuracy_pct']}% | {pre['by_kind']}")
+            mlflow.log_metric("pre_train_accuracy_pct", pre["overall_accuracy_pct"])
+            for kind, acc in pre["by_kind"].items():
+                mlflow.log_metric(f"pre_train_accuracy_{kind}", acc)
 
         for param in model.encoder.parameters():
             param.requires_grad = False
@@ -281,16 +317,36 @@ def train():
         trainable = [p for p in model.parameters() if p.requires_grad]
         trainable_count = sum(p.numel() for p in trainable)
         total_count = sum(p.numel() for p in model.parameters())
-        logger.info(f"Trainable: {trainable_count:,} / {total_count:,}")
-        mlflow.log_param("trainable_params", trainable_count)
-        mlflow.log_param("total_params", total_count)
+        if is_chief:
+            logger.info(f"Trainable: {trainable_count:,} / {total_count:,}")
+            mlflow.log_param("trainable_params", trainable_count)
+            mlflow.log_param("total_params", total_count)
+            mlflow.log_param("world_size", world_size)
 
         model.train()
+
+        # `model` stays the unwrapped module so evaluation, temperature fitting
+        # and state_dict saving below are unaffected by the DDP wrapper.
+        step_model = model
+        if is_distributed:
+            step_model = DistributedDataParallel(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                # Freezing all but the top encoder layers leaves parameters with
+                # no gradient, which DDP rejects unless told to expect it.
+                find_unused_parameters=True,
+            )
+
         optimizer = AdamW(trainable, lr=lr, weight_decay=0.01)
         scaler = torch.amp.GradScaler("cuda", enabled=True)
         total_steps = max(1, (len(train_items) // (micro_batch * grad_accum)) * epochs)
         scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-6)
-        logger.info(f"Training {epochs} epochs, ~{total_steps} optimizer steps")
+        if is_chief:
+            logger.info(
+                f"Training {epochs} epochs, ~{total_steps} optimizer steps per rank, "
+                f"effective batch {micro_batch * grad_accum * world_size}"
+            )
 
         step_count = 0
         t_start = time.perf_counter()
@@ -313,25 +369,41 @@ def train():
                 qtype = b["qtype"].to(device)
                 target = b["target"].to(device)
 
-                with torch.autocast(device_type="cuda", enabled=True):
-                    logits, act = model(input_ids, attention_mask, marker_pos, marker_mask, qtype)
-                    masked = logits.masked_fill(~marker_mask, -1e4)
-                    per_sample = -(target * torch.log_softmax(masked, -1)).sum(-1)
+                is_last_micro = (accum_step + 1) % grad_accum == 0 or (
+                    b_idx + micro_batch
+                ) >= len(train_items)
 
-                    # Weight the positive class on noul questions. qtype 0 is noul, and
-                    # index 1 of the target is the "true" option.
-                    is_noul = (qtype == 0)
-                    is_positive = (target.argmax(-1) == 1)
-                    weights = torch.where(is_noul & is_positive, pos_weight, 1.0).to(per_sample.dtype)
-                    loss_ce = (per_sample * weights).sum() / weights.sum()
-                    loss = loss_ce / grad_accum + 0.0 * act.sum()
+                # All-reducing gradients on every micro-batch wastes most of the
+                # interconnect. Sync only on the batch that steps the optimizer.
+                sync_ctx = (
+                    contextlib.nullcontext()
+                    if (not is_distributed or is_last_micro)
+                    else step_model.no_sync()
+                )
 
-                scaler.scale(loss).backward()
+                with sync_ctx:
+                    with torch.autocast(device_type="cuda", enabled=True):
+                        logits, act = step_model(
+                            input_ids, attention_mask, marker_pos, marker_mask, qtype
+                        )
+                        masked = logits.masked_fill(~marker_mask, -1e4)
+                        per_sample = -(target * torch.log_softmax(masked, -1)).sum(-1)
+
+                        # Weight the positive class on noul questions. qtype 0 is noul, and
+                        # index 1 of the target is the "true" option.
+                        is_noul = (qtype == 0)
+                        is_positive = (target.argmax(-1) == 1)
+                        weights = torch.where(is_noul & is_positive, pos_weight, 1.0).to(per_sample.dtype)
+                        loss_ce = (per_sample * weights).sum() / weights.sum()
+                        loss = loss_ce / grad_accum + 0.0 * act.sum()
+
+                    scaler.scale(loss).backward()
+
                 accum_step += 1
                 running_loss += loss_ce.detach().item()
                 n_batches += 1
 
-                if accum_step % grad_accum == 0 or (b_idx + micro_batch) >= len(train_items):
+                if is_last_micro:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(trainable, 1.0)
                     scaler.step(optimizer)
@@ -339,23 +411,38 @@ def train():
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     step_count += 1
-                    if step_count % 50 == 0:
+                    if step_count % 50 == 0 and is_chief:
                         logger.info(f"Step {step_count}/{total_steps} | loss {loss_ce.item():.4f}")
                         mlflow.log_metric("train_loss", loss_ce.item(), step=step_count)
                         mlflow.log_metric("lr", scheduler.get_last_lr()[0], step=step_count)
 
-            epoch_eval = evaluate(model, val_items, tok.pad_token_id, device)
-            logger.info(
-                f"Epoch {epoch + 1}/{epochs} | train loss {running_loss / max(1, n_batches):.4f} | "
-                f"val {epoch_eval['overall_accuracy_pct']}% | {epoch_eval['by_kind']}"
-            )
-            mlflow.log_metric("epoch_train_loss", running_loss / max(1, n_batches), step=epoch + 1)
-            mlflow.log_metric("epoch_val_accuracy_pct", epoch_eval["overall_accuracy_pct"], step=epoch + 1)
-            mlflow.log_metric("epoch_val_loss", epoch_eval["loss"], step=epoch + 1)
-            for kind, acc in epoch_eval["by_kind"].items():
-                mlflow.log_metric(f"epoch_val_accuracy_{kind}", acc, step=epoch + 1)
+            # Validation runs on the chief only. Every rank holds identical
+            # weights after the all-reduce, so extra copies add nothing.
+            if is_chief:
+                epoch_eval = evaluate(model, val_items, tok.pad_token_id, device)
+                logger.info(
+                    f"Epoch {epoch + 1}/{epochs} | train loss {running_loss / max(1, n_batches):.4f} | "
+                    f"val {epoch_eval['overall_accuracy_pct']}% | {epoch_eval['by_kind']}"
+                )
+                mlflow.log_metric("epoch_train_loss", running_loss / max(1, n_batches), step=epoch + 1)
+                mlflow.log_metric("epoch_val_accuracy_pct", epoch_eval["overall_accuracy_pct"], step=epoch + 1)
+                mlflow.log_metric("epoch_val_loss", epoch_eval["loss"], step=epoch + 1)
+                for kind, acc in epoch_eval["by_kind"].items():
+                    mlflow.log_metric(f"epoch_val_accuracy_{kind}", acc, step=epoch + 1)
+            model.train()
+
+            # Non-chief ranks must not race ahead into the next epoch while the
+            # chief is still evaluating.
+            if is_distributed:
+                dist.barrier()
 
         duration = time.perf_counter() - t_start
+
+        if not is_chief:
+            dist.barrier()
+            dist.destroy_process_group()
+            return None
+
         logger.info(f"Training finished in {duration / 60:.1f} min")
 
         post = evaluate(model, val_items, tok.pad_token_id, device)
@@ -386,14 +473,23 @@ def train():
         os.makedirs(enc_dir, exist_ok=True)
         model.encoder.config.save_pretrained(enc_dir)
 
-        return {
+        summary = {
             "pre_train_accuracy_pct": pre["overall_accuracy_pct"],
             "post_train_accuracy_pct": post["overall_accuracy_pct"],
             "by_kind": post["by_kind"],
             "temperature": temps,
             "training_minutes": round(duration / 60, 2),
             "output_dir": output_dir,
+            "world_size": world_size,
         }
+
+    if is_distributed:
+        # Released after the checkpoint is on disk so no rank exits early and
+        # tears the process group down underneath the chief.
+        dist.barrier()
+        dist.destroy_process_group()
+
+    return summary
 '''
 
 with open("/local_disk0/laya_train_fn.py", "w") as f:
@@ -418,6 +514,10 @@ print("Wrote training function to /local_disk0/laya_train_fn.py")
 # MAGIC test rig treat the two as interchangeable engines.
 
 # COMMAND ----------
+
+# `import json` further up lives inside the training-function source string,
+# so it never lands in the notebook namespace.
+import json
 
 import mlflow
 import pandas as pd
