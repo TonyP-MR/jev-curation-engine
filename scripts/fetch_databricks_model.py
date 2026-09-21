@@ -69,8 +69,11 @@ def main() -> None:
     import mlflow
     from mlflow.tracking import MlflowClient
 
+    # An ambient MLFLOW_TRACKING_URI (the repo has a local sqlite one) otherwise
+    # wins and the registry lookup fails on an unsupported scheme.
+    mlflow.set_tracking_uri("databricks")
     mlflow.set_registry_uri("databricks-uc")
-    client = MlflowClient(registry_uri="databricks-uc")
+    client = MlflowClient(tracking_uri="databricks", registry_uri="databricks-uc")
 
     version = resolve_version(client, args.model, args.version)
     print(f"Downloading {args.model} version {version}...")
@@ -78,14 +81,15 @@ def main() -> None:
     local_path = Path(
         mlflow.artifacts.download_artifacts(f"models:/{args.model}/{version}")
     )
-
-    checkpoint = local_path / CHECKPOINT_SUBPATH
-    if not checkpoint.is_dir():
-        sys.exit(
-            f"Expected Laya weights at {CHECKPOINT_SUBPATH} inside the model artifacts, "
-            f"found: {sorted(p.name for p in local_path.iterdir())}"
-        )
-
+    # The pyfunc lays artifacts out under a directory MLflow chooses, so find
+    # the checkpoint by its contents rather than assuming a path.
+    marker = "model.safetensors"
+    candidates = sorted(local_path.rglob(marker))
+    if not candidates:
+        listing = sorted(p.relative_to(local_path).as_posix() for p in local_path.rglob("*"))
+        sys.exit(f"No {marker} in the downloaded artifacts. Contents:\n  " + "\n  ".join(listing[:60]))
+    checkpoint = candidates[0].parent
+    print(f"Found checkpoint at {checkpoint.relative_to(local_path)}")
     target = Path(args.target)
     if target.exists():
         shutil.rmtree(target)
