@@ -23,9 +23,20 @@
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC `%restart_python` resets the interpreter, so it has to run before anything
+# MAGIC else. Any variable defined above it is discarded.
+
+# COMMAND ----------
+
+# MAGIC %pip install laya>=0.3.4 transformers>=5.17.0 --quiet
+# MAGIC %restart_python
+
+# COMMAND ----------
+
 dbutils.widgets.dropdown("source_mode", "azure", ["azure", "volume"], "Blob source")
 dbutils.widgets.text("azure_account", "stcurationauditprod", "Azure storage account")
-dbutils.widgets.text("azure_container", "audit-blobs", "Azure container")
+dbutils.widgets.text("azure_container", "pipeline-audit", "Azure container")
 dbutils.widgets.text("volume_path", "/Volumes/muckrack_data/laya/audit_blobs", "UC volume path")
 dbutils.widgets.text("config_path", "/Volumes/muckrack_data/laya/configs", "Config snapshot path")
 dbutils.widgets.text("catalog", "muckrack_data", "Catalog")
@@ -49,11 +60,6 @@ GOLD_SEQUENCES = f"{CATALOG}.{SCHEMA}.training_sequences"
 
 # COMMAND ----------
 
-# MAGIC %pip install laya>=0.3.4 transformers>=5.17.0 --quiet
-# MAGIC %restart_python
-
-# COMMAND ----------
-
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 
 if SOURCE_MODE == "azure":
@@ -72,6 +78,14 @@ print(f"Reading audit blobs from {blob_source}")
 # MAGIC %md
 # MAGIC ## 1. Ingest audit blobs and config snapshots
 # MAGIC
+# MAGIC Auto Loader rather than a plain glob. The `pipeline-audit` container holds far
+# MAGIC more than the 5,000 blobs a single list page returns, and `spark.read` with a
+# MAGIC `*.json` glob enumerates the whole container before `limit()` applies. A 300-blob
+# MAGIC smoke test then spends its time listing hundreds of thousands of files.
+# MAGIC
+# MAGIC Auto Loader lists incrementally and checkpoints what it has seen, so a bounded
+# MAGIC run stays bounded and the next run picks up only new blobs.
+# MAGIC
 # MAGIC Blobs are read as whole text so the Python parsing below stays identical to the
 # MAGIC local `dataset_builder.py`. `wholetext` avoids Spark's JSON schema inference,
 # MAGIC which flattens the nested `subject_results` and `scored_attributes` structures.
@@ -80,10 +94,22 @@ print(f"Reading audit blobs from {blob_source}")
 
 from pyspark.sql import functions as F
 
-raw_blobs = (
-    spark.read.format("text")
+CHECKPOINT = f"/Volumes/{CATALOG}/{SCHEMA}/checkpoints/bronze_audit_blobs"
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {CATALOG}.{SCHEMA}.checkpoints")
+
+stream = (
+    spark.readStream.format("cloudFiles")
+    .option("cloudFiles.format", "text")
+    .option("cloudFiles.schemaLocation", f"{CHECKPOINT}/schema")
     .option("wholetext", "true")
-    .load(f"{blob_source.rstrip('/')}/*.json")
+    .option("pathGlobFilter", "*.json")
+)
+
+if BLOBS_LIMIT > 0:
+    stream = stream.option("cloudFiles.maxFilesPerTrigger", str(BLOBS_LIMIT))
+
+raw_blobs = (
+    stream.load(blob_source)
     .select(
         F.col("value").alias("payload"),
         F.col("_metadata.file_path").alias("source_path"),
@@ -91,10 +117,27 @@ raw_blobs = (
     )
 )
 
-if BLOBS_LIMIT > 0:
-    raw_blobs = raw_blobs.limit(BLOBS_LIMIT)
+# `availableNow` drains what is currently there and stops, honouring
+# maxFilesPerTrigger as a per-batch cap. A bounded smoke run uses one batch.
+query = (
+    raw_blobs.writeStream
+    .option("checkpointLocation", f"{CHECKPOINT}/state")
+    .trigger(availableNow=True)
+    .toTable(BRONZE_BLOBS)
+)
 
-raw_blobs.write.mode("overwrite").saveAsTable(BRONZE_BLOBS)
+if BLOBS_LIMIT > 0:
+    # Stop after the first batch so a smoke run does not drain the container.
+    import time
+    while query.isActive:
+        if query.recentProgress and sum(p["numInputRows"] for p in query.recentProgress) >= BLOBS_LIMIT:
+            query.stop()
+            break
+        time.sleep(2)
+    query.awaitTermination()
+else:
+    query.awaitTermination()
+
 blob_count = spark.table(BRONZE_BLOBS).count()
 print(f"Ingested {blob_count} audit blobs into {BRONZE_BLOBS}")
 

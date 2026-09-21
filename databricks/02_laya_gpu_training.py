@@ -21,6 +21,17 @@
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC `%restart_python` resets the interpreter, so it has to run before anything
+# MAGIC else. Any variable defined above it is discarded.
+
+# COMMAND ----------
+
+# MAGIC %pip install laya>=0.3.4 transformers>=5.17.0 safetensors --quiet
+# MAGIC %restart_python
+
+# COMMAND ----------
+
 dbutils.widgets.text("catalog", "muckrack_data", "Catalog")
 dbutils.widgets.text("schema", "laya", "Schema")
 dbutils.widgets.text("epochs", "3", "Epochs")
@@ -45,11 +56,6 @@ MODEL_NAME = dbutils.widgets.get("model_name")
 
 SEQUENCES_TABLE = f"{CATALOG}.{SCHEMA}.training_sequences"
 REGISTERED_MODEL = f"{CATALOG}.{SCHEMA}.{MODEL_NAME}"
-
-# COMMAND ----------
-
-# MAGIC %pip install laya>=0.3.4 transformers>=5.17.0 safetensors --quiet
-# MAGIC %restart_python
 
 # COMMAND ----------
 
