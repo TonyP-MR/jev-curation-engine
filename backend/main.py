@@ -16,12 +16,16 @@ from audit_index import audit_index
 from blob_manager import blob_manager
 from prompt_optimizer import PromptOptimizationError, prompt_optimizer
 from question_converter import (
+    ASSEMBLER_VERSION,
     build_article_state,
     build_distilled_article_state,
     convert_config_to_jev_questions,
-    extract_subject_aliases,
+    subject_match_terms,
+    subject_mention_patterns,
+    subject_presence_patterns,
     strip_boilerplate_and_recirculation,
 )
+from laya_questions import build_laya_questions
 from typesafe_runner import typesafe_runner
 from comparator import compare_article_results
 from run_logger import run_logger
@@ -70,6 +74,66 @@ class PreviewRequest(BaseModel):
     config_id: Optional[str] = None
     model: Optional[str] = None
     provider: Optional[str] = None
+    optimize_prompts: bool = False
+
+
+def _is_laya_selection(model: Optional[str], provider: Optional[str]) -> bool:
+    hint = (provider or settings.JEV_PROVIDER).lower()
+    name = str(model or "").lower()
+    return (
+        hint in {"laya", "laya_azure", "laya_databricks", "laya_local"}
+        or name.startswith(("laya", "local:"))
+    )
+
+
+def _validate_prompt_optimization_request(
+    optimize_prompts: bool,
+    model: Optional[str],
+    provider: Optional[str],
+) -> None:
+    if not optimize_prompts:
+        return
+    if _is_laya_selection(model, provider):
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt optimization is available only for Jev; Laya uses canonical training prompts.",
+        )
+    if not settings.PROMPT_OPTIMIZATION_ENABLED:
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt optimization is disabled; set PROMPT_OPTIMIZATION_ENABLED=true",
+        )
+    if not settings.GEMINI_API_KEY:
+        raise HTTPException(
+            status_code=400,
+            detail="Prompt optimization requires GEMINI_API_KEY in the environment",
+        )
+
+
+async def _assemble_questions(
+    snapshot: Dict[str, Any],
+    metadata: Dict[str, Any],
+    *,
+    optimize_prompts: bool,
+    model: Optional[str],
+    provider: Optional[str],
+) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    if _is_laya_selection(model, provider):
+        if optimize_prompts:
+            raise PromptOptimizationError(
+                "Prompt optimization is available only for Jev; Laya uses canonical training prompts."
+            )
+        return build_laya_questions(snapshot), {"enabled": False, "diagnostics": []}
+
+    questions = convert_config_to_jev_questions(snapshot)
+    if not optimize_prompts:
+        return questions, {"enabled": False, "diagnostics": []}
+    return await prompt_optimizer.optimize_questions(
+        questions,
+        snapshot,
+        metadata,
+        ASSEMBLER_VERSION,
+    )
 
 @app.get("/api/health")
 def health_check():
@@ -228,10 +292,12 @@ def get_blob_details(blob_name: str):
 
 
 @app.post("/api/preview")
-def preview_payload(req: PreviewRequest):
-    """Assemble (without calling Jev) the exact TypeSafe request for one blob+config,
-    alongside the baseline LLM decision archived in the blob."""
+async def preview_payload(req: PreviewRequest):
+    """Assemble the exact request artifact used by the selected decision engine."""
     try:
+        _validate_prompt_optimization_request(
+            req.optimize_prompts, req.model, req.provider
+        )
         blob = blob_manager.get_blob(req.blob_name)
         cfg_id = req.config_id or blob.get("config_id")
         if not cfg_id:
@@ -244,16 +310,28 @@ def preview_payload(req: PreviewRequest):
         if not config_data:
             raise HTTPException(status_code=404, detail=f"No published config for {cfg_id}")
         snapshot = config_data["snapshot"]
-        questions = convert_config_to_jev_questions(snapshot)
-        state_text, state_meta = build_article_state(blob)
+        questions, optimizer_metadata = await _assemble_questions(
+            snapshot,
+            config_data["metadata"],
+            optimize_prompts=req.optimize_prompts,
+            model=req.model,
+            provider=req.provider,
+        )
+        if _is_laya_selection(req.model, req.provider):
+            blob_for_state = dict(blob)
+            blob_for_state["subjects"] = snapshot.get("subjects", [])
+            state_text, state_meta = build_distilled_article_state(blob_for_state)
+        else:
+            state_text, state_meta = build_article_state(blob)
 
         return {
             "blob_name": req.blob_name,
             "config": config_data["metadata"],
             "question_count": len(questions),
             "state_meta": state_meta,
+            "prompt_optimization": optimizer_metadata,
             "typesafe_request": {
-                "model": settings.TYPESAFE_MODEL,
+                "model": req.model or settings.TYPESAFE_MODEL,
                 "state": state_text,
                 "questions": questions,
             },
@@ -267,9 +345,11 @@ def preview_payload(req: PreviewRequest):
         }
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Error building preview for {req.blob_name}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    except PromptOptimizationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error(f"Error building preview for {req.blob_name}: {exc}")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 async def execute_benchmark_task(
@@ -289,14 +369,13 @@ async def execute_benchmark_task(
             config_totals[cfg_id] = config_totals.get(cfg_id, 0) + 1
             config_completed[cfg_id] = 0
 
-    optimized_rubrics: Dict[str, tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    compiled_questions: Dict[
+        str, tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]
+    ] = {}
     config_snapshots: Dict[str, Dict[str, Any]] = {}
     lock = asyncio.Lock()
-    is_laya_run = (
-        (req.provider and req.provider.lower().startswith("laya"))
-        or (req.model and ("laya" in str(req.model).lower() or str(req.model).lower().startswith("local:")))
-        or settings.JEV_PROVIDER.lower().startswith("laya")
-    )
+    compile_lock = asyncio.Lock()
+    is_laya_run = _is_laya_selection(req.model, req.provider)
     concurrency_limit = getattr(settings, "LAYA_BENCHMARK_CONCURRENCY", 15) if is_laya_run else settings.BENCHMARK_CONCURRENCY
     sem = asyncio.Semaphore(concurrency_limit)
 
@@ -308,20 +387,24 @@ async def execute_benchmark_task(
             config_ids=config_ids or None,
         )
 
-        # Pre-fetch and cache configs & rubrics before starting parallel workers
+        # Pre-fetch each config and compile the exact question artifact once.
         for cfg_id in config_ids:
             try:
                 config_data = config_manager.fetch_published_config(config_id=cfg_id)
             except LookupError:
                 config_data = config_manager.fetch_historical_config(cfg_id)
             config_snapshots[cfg_id] = config_data
-            if req.optimize_prompts and cfg_id not in optimized_rubrics:
+            if req.optimize_prompts:
                 ACTIVE_JOBS[job_id]["phase"] = "optimizing_prompts"
                 ACTIVE_JOBS[job_id]["optimizer_config"] = cfg_id
                 ACTIVE_JOBS[job_id]["optimizer_status"] = "compiling"
-                optimized_rubrics[cfg_id] = await prompt_optimizer.optimize_snapshot(
-                    config_data["snapshot"], config_data["metadata"]
-                )
+            compiled_questions[cfg_id] = await _assemble_questions(
+                config_data["snapshot"],
+                config_data["metadata"],
+                optimize_prompts=req.optimize_prompts,
+                model=req.model,
+                provider=req.provider,
+            )
 
         ACTIVE_JOBS[job_id]["phase"] = "evaluating"
 
@@ -329,8 +412,14 @@ async def execute_benchmark_task(
             async with sem:
                 try:
                     blob_audit = blob_manager.get_blob(blob_name)
-                    cfg_id = item_config_id or req.config_id or blob_audit.get("config_id")
-
+                    resolved_config_id = (
+                        item_config_id or req.config_id or blob_audit.get("config_id")
+                    )
+                    if not resolved_config_id:
+                        raise LookupError(
+                            f"No config ID is available for benchmark blob {blob_name}"
+                        )
+                    cfg_id = str(resolved_config_id)
                     if cfg_id in config_snapshots:
                         config_data = config_snapshots[cfg_id]
                     else:
@@ -341,17 +430,23 @@ async def execute_benchmark_task(
                         config_snapshots[cfg_id] = config_data
 
                     snapshot = config_data["snapshot"]
-                    optimized_rubric, optimizer_metadata = (
-                        optimized_rubrics.get(cfg_id, (None, {"enabled": False}))
-                    )
-                    is_laya = (
-                        (req.provider and req.provider.lower().startswith("laya"))
-                        or (req.model and ("laya" in str(req.model).lower() or str(req.model).lower().startswith("local:")))
-                        or settings.JEV_PROVIDER.lower().startswith("laya")
-                    )
-                    jev_questions = convert_config_to_jev_questions(
-                        snapshot, optimized_rubric, is_system_one=is_laya
-                    )
+                    if cfg_id not in compiled_questions:
+                        async with compile_lock:
+                            if cfg_id not in compiled_questions:
+                                if req.optimize_prompts:
+                                    ACTIVE_JOBS[job_id]["phase"] = "optimizing_prompts"
+                                    ACTIVE_JOBS[job_id]["optimizer_config"] = cfg_id
+                                    ACTIVE_JOBS[job_id]["optimizer_status"] = "compiling"
+                                compiled_questions[cfg_id] = await _assemble_questions(
+                                    snapshot,
+                                    config_data["metadata"],
+                                    optimize_prompts=req.optimize_prompts,
+                                    model=req.model,
+                                    provider=req.provider,
+                                )
+                                ACTIVE_JOBS[job_id]["phase"] = "evaluating"
+                    jev_questions, optimizer_metadata = compiled_questions[cfg_id]
+                    is_laya = is_laya_run
                     if is_laya:
                         blob_for_distill = dict(blob_audit)
                         if "subjects" in snapshot:
@@ -372,22 +467,28 @@ async def execute_benchmark_task(
                         gated_answers: Dict[str, Any] = {}
                         active_questions = dict(jev_questions)
 
-                        # Stage 0: Deterministic presence gating & Headline Primacy
+                        # Stage 0: Presence evidence & Headline Primacy.
+                        # Absence of a literal match is evidence, not a verdict: the match
+                        # terms are derived from a curator-authored label with no alias list
+                        # behind it, so a miss is as likely to be a naming gap as a genuinely
+                        # absent entity. Missing subjects are still put to the model, just
+                        # behind a stricter validation threshold.
                         VENUE_SUFFIXES = ("coliseum", "arena", "stadium", "center", "field", "park", "theater", "theatre", "amphitheatre", "pavilion")
+                        unmatched_subject_ids: set[str] = set()
                         for s in snapshot.get("subjects", []):
                             s_id = str(s["id"])
                             s_name = s.get("name")
-                            aliases = extract_subject_aliases(s)
-                            alias_res = [re.compile(r'\b' + re.escape(a) + r'\b', re.IGNORECASE) for a in aliases]
-                            
+                            presence_res = subject_presence_patterns(s)
+                            strict_res = subject_mention_patterns(s)
+
                             # Filter out naming-rights physical venues (e.g. Coca-Cola Coliseum, Kia Center)
                             # unless article explicitly discusses naming rights, sponsorship, or corporate strategy
                             has_venue_only = False
                             m_all = []
-                            for r in alias_res:
+                            for r in presence_res:
                                 for match in r.finditer(full_text):
                                     m_all.append(match)
-                            
+
                             if m_all:
                                 venue_context_count = 0
                                 for m in m_all:
@@ -398,22 +499,17 @@ async def execute_benchmark_task(
                                     has_venue_only = True
 
                             has_mention = bool(m_all) and not has_venue_only
-                            in_hl = (s_name in hl_entities or any(r.search(inbound_data.get("headline") or blob_audit.get("headline") or "") for r in alias_res)) and not has_venue_only
-                            
-                            if not has_mention and not in_hl:
-                                gated_answers[f"subj_{s_id}_valid"] = {"type": "noul", "noul": 0.0, "confidence": 1.0, "action": {"act_probability": 1.0}}
-                                gated_answers[f"subj_{s_id}_prominence"] = {"type": "choice", "choice": "passing", "probabilities": {"primary": 0.0, "significant": 0.0, "passing": 1.0}, "confidence": 1.0, "action": {"act_probability": 1.0}}
-                                gated_answers[f"subj_{s_id}_sentiment"] = {"type": "choice", "choice": "neutral", "probabilities": {"positive": 0.0, "negative": 0.0, "neutral": 1.0, "balanced": 0.0}, "confidence": 1.0, "action": {"act_probability": 1.0}}
-                                for t in s.get("tag_evaluations", []):
-                                    t_id = t["tag_id"]
-                                    gated_answers[f"tag_{s_id}_{t_id}"] = {"type": "noul", "noul": 0.0, "confidence": 1.0, "action": {"act_probability": 1.0}}
-                                for k in list(active_questions.keys()):
-                                    if k.startswith(f"subj_{s_id}_") or k.startswith(f"tag_{s_id}_"):
-                                        active_questions.pop(k, None)
-                            elif in_hl:
+                            # Headline primacy asserts validity outright, so it takes the
+                            # strict terms only — a generic token like "Museum" in a
+                            # headline must not certify the subject.
+                            in_hl = (s_name in hl_entities or any(r.search(inbound_data.get("headline") or blob_audit.get("headline") or "") for r in strict_res)) and not has_venue_only
+
+                            if in_hl:
                                 # Headline Primacy: Corporate releases naming the entity in the headline are 100% valid
                                 gated_answers[f"subj_{s_id}_valid"] = {"type": "noul", "noul": 1.0, "confidence": 1.0, "action": {"act_probability": 1.0}}
                                 active_questions.pop(f"subj_{s_id}_valid", None)
+                            elif not has_mention:
+                                unmatched_subject_ids.add(s_id)
 
                         # Stage 1: Validation Gating (fast single-pass check)
                         val_questions = {k: v for k, v in active_questions.items() if k.endswith("_valid")}
@@ -429,12 +525,18 @@ async def execute_benchmark_task(
                             gated_answers.update(val_answers)
 
                             val_threshold = getattr(settings, "VALIDATION_THRESHOLD", 0.45)
+                            absent_threshold = getattr(settings, "ABSENT_ENTITY_VALIDATION_THRESHOLD", 0.65)
                             for s in snapshot.get("subjects", []):
                                 s_id = str(s["id"])
                                 s_name = s.get("name")
                                 val_key = f"subj_{s_id}_valid"
                                 in_lead = s_name in lead_entities
-                                effective_threshold = 0.35 if in_lead else val_threshold
+                                if in_lead:
+                                    effective_threshold = 0.35
+                                elif s_id in unmatched_subject_ids:
+                                    effective_threshold = absent_threshold
+                                else:
+                                    effective_threshold = val_threshold
                                 if val_key in val_answers:
                                     noul_score = val_answers[val_key].get("noul", 0.0)
                                     if noul_score < effective_threshold:
@@ -479,7 +581,7 @@ async def execute_benchmark_task(
                         
                         # Pre-calculate mention counts across all subjects for relative share calculation
                         subject_aliases_map = {
-                            str(s["id"]): [re.compile(r'\b' + re.escape(a) + r'\b', re.IGNORECASE) for a in extract_subject_aliases(s)]
+                            str(s["id"]): subject_mention_patterns(s)
                             for s in snapshot.get("subjects", [])
                         }
                         subject_mentions_map = {
@@ -493,14 +595,13 @@ async def execute_benchmark_task(
                         for s in snapshot.get("subjects", []):
                             s_id = str(s["id"])
                             s_name = s.get("name")
-                            alias_res = subject_aliases_map.get(s_id, [])
                             mention_count = subject_mentions_map.get(s_id, 0)
                             in_hl = s_name in hl_entities
                             in_lead = s_name in lead_entities
                             prom_key = f"subj_{s_id}_prominence"
                             sent_key = f"subj_{s_id}_sentiment"
                             valid_key = f"subj_{s_id}_valid"
-                            is_valid = answers_map.get(valid_key, {}).get("noul", 0.0) >= 0.45
+                            is_valid = answers_map.get(valid_key, {}).get("noul", 0.0) >= getattr(settings, "VALIDATION_THRESHOLD", 0.45)
 
                             # Prominence floor, ceiling, and relative mention share constraints
                             if is_valid and prom_key in answers_map:
@@ -527,7 +628,7 @@ async def execute_benchmark_task(
                                             re.search(r'(?:,\s*|\band\s+)' + re.escape(a) + r'(?:,\s*|\band\s+|\s*\))', full_text, re.IGNORECASE)
                                             or re.search(r'\(\s*(?:[^)]*,\s*)?' + re.escape(a) + r'(?:,\s*[^)]*)?\)', full_text, re.IGNORECASE)
                                         )
-                                        for a in extract_subject_aliases(s)
+                                        for a in subject_match_terms(s)
                                     )
                                     if (in_list_context or mention_count < 3) and not in_hl:
                                         if current_choice == "primary":
@@ -568,7 +669,9 @@ async def execute_benchmark_task(
                                         if s_tot > 0:
                                             probs = {k: round(v / s_tot, 4) for k, v in probs.items()}
                                         s_ans["probabilities"] = probs
-                                        s_ans["choice"] = max(probs, key=probs.get)
+                                        s_ans["choice"] = max(
+                                            probs.items(), key=lambda item: float(item[1])
+                                        )[0]
                     else:
                         state_text, _ = build_article_state(blob_audit)
                         jev_result = await typesafe_runner.evaluate_article(
@@ -684,16 +787,9 @@ async def execute_benchmark_task(
 async def start_benchmark(req: RunBenchmarkRequest, background_tasks: BackgroundTasks):
     if not req.blob_names:
         raise HTTPException(status_code=400, detail="Must provide at least one blob name")
-    if req.optimize_prompts and not settings.PROMPT_OPTIMIZATION_ENABLED:
-        raise HTTPException(
-            status_code=400,
-            detail="Prompt optimization is disabled; set PROMPT_OPTIMIZATION_ENABLED=true",
-        )
-    if req.optimize_prompts and not settings.GEMINI_API_KEY:
-        raise HTTPException(
-            status_code=400,
-            detail="Prompt optimization requires GEMINI_API_KEY in the environment",
-        )
+    _validate_prompt_optimization_request(
+        req.optimize_prompts, req.model, req.provider
+    )
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     job_id = f"run_{timestamp}_{len(req.blob_names)}_items"
@@ -716,16 +812,9 @@ async def start_batch_benchmark(req: BatchBenchmarkRequest, background_tasks: Ba
     config_ids = list(dict.fromkeys(config_id.strip() for config_id in req.config_ids if config_id and config_id.strip()))
     if not config_ids:
         raise HTTPException(status_code=400, detail="Must provide at least one config ID")
-    if req.optimize_prompts and not settings.PROMPT_OPTIMIZATION_ENABLED:
-        raise HTTPException(
-            status_code=400,
-            detail="Prompt optimization is disabled; set PROMPT_OPTIMIZATION_ENABLED=true",
-        )
-    if req.optimize_prompts and not settings.GEMINI_API_KEY:
-        raise HTTPException(
-            status_code=400,
-            detail="Prompt optimization requires GEMINI_API_KEY in the environment",
-        )
+    _validate_prompt_optimization_request(
+        req.optimize_prompts, req.model, req.provider
+    )
 
     # Select the newest indexed articles once, then preserve config and article
     # order while the background task evaluates them sequentially.

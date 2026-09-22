@@ -1,8 +1,11 @@
 import os
 import json
 import datetime
+import logging
 from typing import Any, Dict, List, Optional
 from config import settings
+
+logger = logging.getLogger(__name__)
 
 class RunLogger:
     def __init__(self):
@@ -121,10 +124,21 @@ class RunLogger:
         sent_acc = pct(sent_correct, sent_total)
         tag_acc = pct(tag_correct, tag_total)
 
-        optimizer_records = [c.get("prompt_optimization") for c in comparisons if c.get("prompt_optimization", {}).get("enabled")]
+        optimizer_records: List[Dict[str, Any]] = []
+        for comparison in comparisons:
+            record = comparison.get("prompt_optimization")
+            if isinstance(record, dict) and record.get("enabled"):
+                optimizer_records.append(record)
         optimizer_by_cache = {
-            r.get("cache_key"): r for r in optimizer_records if r.get("cache_key")
+            record["cache_key"]: record
+            for record in optimizer_records
+            if record.get("cache_key")
         }
+        optimizer_diagnostics = [
+            diagnostic
+            for record in optimizer_by_cache.values()
+            for diagnostic in record.get("diagnostics", [])
+        ]
         optimizer_summary = {
             "enabled": bool(optimizer_records),
             "configs_compiled": len(optimizer_by_cache),
@@ -132,6 +146,7 @@ class RunLogger:
             "optimizer_duration_ms": round(sum(r.get("duration_ms", 0.0) for r in optimizer_by_cache.values()), 2),
             "original_question_chars": sum(r.get("original_question_chars", 0) for r in optimizer_by_cache.values()),
             "optimized_question_chars": sum(r.get("optimized_question_chars", 0) for r in optimizer_by_cache.values()),
+            "diagnostics": optimizer_diagnostics,
         }
         if optimizer_summary["original_question_chars"]:
             optimizer_summary["estimated_char_reduction_pct"] = round(
@@ -298,7 +313,7 @@ Comparison of {cand_name} decisions against baseline LLM audit labels:
         meta_file = os.path.join(r_dir, "run_meta.json")
         records_dir = os.path.join(r_dir, "records")
 
-        data = {"run_id": run_id}
+        data: Dict[str, Any] = {"run_id": run_id}
         if os.path.exists(meta_file):
             with open(meta_file, "r") as f:
                 data["meta"] = json.load(f)

@@ -284,6 +284,8 @@ export default function App() {
   const [errorFilter, setErrorFilter] = useState('all');
   const [selectedModel, setSelectedModel] = useState('laya:azure:t4');
   const [providersData, setProvidersData] = useState(null);
+  const isLayaSelected = selectedModel.startsWith('laya') || selectedModel.startsWith('local:');
+  const optimizerSelectable = optimizerAvailable && !isLayaSelected;
   const configCounts = useMemo(() => {
     const m = {};
     for (const c of blobConfigs) m[c.config_id] = c.count;
@@ -314,6 +316,9 @@ export default function App() {
       }
     })();
   }, []);
+  useEffect(() => {
+    if (isLayaSelected) setOptimizePrompts(false);
+  }, [isLayaSelected]);
 
   // Blob list follows the selected config.
   useEffect(() => {
@@ -387,7 +392,13 @@ export default function App() {
     setPreviewLoading(true);
     setPreviewTab('request');
     try {
-      const body = { blob_name: blob.name, config_id: selectedConfig, model: selectedModel };
+      const body = {
+        blob_name: blob.name,
+        config_id: selectedConfig,
+        model: selectedModel,
+        provider: providerFor(selectedModel),
+        optimize_prompts: optimizePrompts && !isLayaSelected,
+      };
       setPreview(await apiPost('/preview', body));
     } catch (e) {
       console.error(e);
@@ -774,15 +785,24 @@ const pctLabel = v => (v === null || v === undefined ? 'n/a' : `${v}%`);
                   className="px-3 py-2 border border-slate-300 rounded-lg text-sm w-36 bg-slate-50 font-mono"
                 />
               </div>
-              <label className={`flex items-center gap-2 text-xs whitespace-nowrap ${optimizerAvailable ? 'text-slate-600 cursor-pointer' : 'text-slate-400 cursor-not-allowed'}`} title={optimizerAvailable ? 'Compile the configuration rules with Gemini once, then reuse the cached rubric for this run.' : 'Add GEMINI_API_KEY and set PROMPT_OPTIMIZATION_ENABLED=true to enable this option.'}>
+              <label
+                className={`flex items-center gap-2 text-xs whitespace-nowrap ${optimizerSelectable ? 'text-slate-600 cursor-pointer' : 'text-slate-400 cursor-not-allowed'}`}
+                title={
+                  isLayaSelected
+                    ? 'Laya uses canonical prompts coupled to training; runtime optimization is unavailable.'
+                    : optimizerAvailable
+                      ? 'Optimize the complete assembled Jev question map with Gemini and reuse the validated cache artifact.'
+                      : 'Add GEMINI_API_KEY and set PROMPT_OPTIMIZATION_ENABLED=true to enable this option.'
+                }
+              >
                 <input
                   type="checkbox"
                   checked={optimizePrompts}
-                  disabled={!optimizerAvailable}
+                  disabled={!optimizerSelectable}
                   onChange={e => setOptimizePrompts(e.target.checked)}
                   className="h-4 w-4 rounded border-slate-300 text-[#0b82f4] disabled:opacity-50"
                 />
-                Optimize prompts with Gemini
+                Optimize Jev questions with Gemini
               </label>
 
               <div className="ml-auto w-full lg:w-auto flex flex-wrap items-center justify-end gap-2">
@@ -1040,12 +1060,14 @@ const pctLabel = v => (v === null || v === undefined ? 'n/a' : `${v}%`);
                   )}
                   {optimizerInfo && (
                     <div className="mt-3 px-3 py-2 rounded-lg bg-violet-50 border border-violet-200 text-xs text-violet-800">
-                      Prompt optimizer: {optimizerInfo.model} · {optimizerInfo.cached ? 'cached rubric' : 'compiled this run'} · optimizer cost ${Number(optimizerInfo.cost_usd || 0).toFixed(6)}
+                      Prompt optimizer: {optimizerInfo.model} · {optimizerInfo.cached ? 'validated cache hit' : 'compiled this run'} · {optimizerInfo.original_question_chars?.toLocaleString()} → {optimizerInfo.optimized_question_chars?.toLocaleString()} characters · optimizer cost ${Number(optimizerInfo.cost_usd || 0).toFixed(6)}
+                      {optimizerInfo.diagnostics?.length > 0 && ` · ${optimizerInfo.diagnostics.length} source ${optimizerInfo.diagnostics.length === 1 ? 'diagnostic' : 'diagnostics'}`}
                     </div>
                   )}
                   {summary.prompt_optimization?.enabled && (
                     <div className="mt-2 px-3 py-2 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600">
-                      Question payload: {summary.prompt_optimization.original_question_chars.toLocaleString()} → {summary.prompt_optimization.optimized_question_chars.toLocaleString()} characters ({summary.prompt_optimization.estimated_char_reduction_pct ?? 0}% estimated reduction) across {summary.prompt_optimization.configs_compiled} config(s).
+                      Question payload: {summary.prompt_optimization.original_question_chars.toLocaleString()} → {summary.prompt_optimization.optimized_question_chars.toLocaleString()} characters ({summary.prompt_optimization.estimated_char_reduction_pct ?? 0}% reduction) across {summary.prompt_optimization.configs_compiled} config(s).
+                      {summary.prompt_optimization.diagnostics?.length > 0 && ` ${summary.prompt_optimization.diagnostics.length} defective source ${summary.prompt_optimization.diagnostics.length === 1 ? 'question was' : 'questions were'} preserved verbatim.`}
                     </div>
                   )}
                   {analysisError && (
@@ -1234,6 +1256,21 @@ const pctLabel = v => (v === null || v === undefined ? 'n/a' : `${v}%`);
                   </button>
                 ))}
               </div>
+
+              {preview.prompt_optimization?.enabled && (
+                <div className="rounded-lg border border-violet-200 bg-violet-50 px-3 py-2 text-xs text-violet-800">
+                  Optimized Jev artifact · {preview.prompt_optimization.cached ? 'validated cache hit' : 'compiled now'} · {preview.prompt_optimization.original_question_chars.toLocaleString()} → {preview.prompt_optimization.optimized_question_chars.toLocaleString()} characters ({preview.prompt_optimization.character_reduction_pct}% reduction).
+                  {preview.prompt_optimization.diagnostics?.length > 0 && (
+                    <ul className="mt-2 list-disc pl-4">
+                      {preview.prompt_optimization.diagnostics.map(diagnostic => (
+                        <li key={`${diagnostic.question_id}-${diagnostic.code}`}>
+                          <span className="font-mono">{diagnostic.question_id}</span>: {diagnostic.message}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
 
               {previewTab === 'request' && (
                 <div className="space-y-3">

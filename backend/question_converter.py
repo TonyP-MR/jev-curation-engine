@@ -1,14 +1,10 @@
 import re
 from typing import Any
 
+from laya_questions import STATE_MAX_CHARS, build_laya_state, sanitize_heading
 
-def sanitize_heading(text: str) -> str:
-    """Strips leading markdown heading markers (#) from text lines."""
-    if not text:
-        return ""
-    lines = text.split("\n")
-    cleaned = [re.sub(r"^\s*#+\s*", "", line) for line in lines]
-    return "\n".join(cleaned).strip()
+ASSEMBLER_VERSION = "2"
+
 
 def build_article_state(blob_data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """
@@ -89,97 +85,132 @@ def strip_boilerplate_and_recirculation(body: str) -> str:
     return "\n\n".join(cleaned)
 
 
-def extract_subject_aliases(s: dict[str, Any]) -> list[str]:
-    """Extracts official entity name, compound brands (e.g. Air France, KLM for Air France-KLM),
-    acronyms, and operating unit tag names from a subject definition."""
-    name = s.get("name", "").strip()
-    if not name:
+# Subject labels are curator-authored and only ever carry `name`, `entity_definition`
+# and the three prompts — no structured alias list exists in any config snapshot.
+# Across 1430 subjects in the cached configs the label is the entity plus, at most, a
+# parenthetical qualifier or acronym ("Chobani (creamers)", "Museum of Modern Art
+# (MoMA)") or a curation scope phrase ("Redwire All"). Matching the label verbatim
+# therefore fails on any decorated name, so matching is done on the label's
+# distinctive tokens instead of per-config suffix lists.
+_PARENTHETICAL_RE = re.compile(r"\(([^)]{1,40})\)")
+_CORP_SUFFIX_RE = re.compile(
+    r"(?i)[\s,]+(?:group|corp|corporation|inc\.?|llc|l\.l\.c\.?|ltd\.?|limited|co\.?|company|"
+    r"pbc|plc|enterprises|holdings?|ag|nv|bv|sa|gmbh|a/s)$"
+)
+
+# Tokens that never identify an entity on their own: corporate/legal boilerplate,
+# curation scope words, and category nouns. A label reduced to only these words falls
+# back to the whole label.
+NON_DISTINCTIVE_TOKENS = {
+    "all", "only", "mentions", "mention", "coverage", "exclude", "excluding", "excl",
+    "include", "including", "incl", "and", "the", "of", "for", "de", "du", "van", "von",
+    "group", "corp", "corporation", "inc", "llc", "ltd", "limited", "co", "company",
+    "pbc", "plc", "enterprises", "holding", "holdings", "ag", "nv", "bv", "sa", "gmbh",
+    "stocks", "financials", "news", "brand", "brands", "global", "international",
+    "systems", "technologies", "solutions", "services", "media", "digital", "online",
+    "network", "networks", "communications", "management", "capital", "partners",
+    "energy", "health", "care", "foods", "software", "wireless", "mobile", "telecom",
+}
+
+
+def canonical_subject_name(s: dict[str, Any]) -> str:
+    """Config label without its parenthetical qualifier ('Chobani (creamers)' -> 'Chobani')."""
+    name = (s.get("name") or "").strip()
+    return _PARENTHETICAL_RE.sub(" ", name).strip().strip(" \t-–—:,") or name
+
+
+def subject_match_terms(s: dict[str, Any]) -> list[str]:
+    """Strict surface forms of the subject: full label, legal-suffix-free base,
+    parenthetical acronym, and hyphen components of compound brands.
+
+    These carry the entity identity on their own, so they are safe to count. Mention
+    counts drive the prominence floor/ceiling heuristics, where a loose term would
+    inflate an incidental article into 'significant'.
+    """
+    raw_name = (s.get("name") or "").strip()
+    canonical = canonical_subject_name(s)
+    if not canonical:
         return []
 
-    aliases: set[str] = {name}
+    terms: set[str] = {canonical}
 
-    clean_base = re.sub(
-        r"(?i)\s+(group|corp|corporation|inc\.?|llc|ltd\.?|limited|co\.?|company|pbc|enterprises|holdings?)$",
-        "",
-        name,
-    ).strip()
-    if clean_base and len(clean_base) > 2:
-        aliases.add(clean_base)
+    base = _CORP_SUFFIX_RE.sub("", canonical).strip()
+    if len(base) > 2:
+        terms.add(base)
 
-    GENERIC_CATEGORY_WORDS = {
-        "cola", "systems", "technologies", "software", "foods", "health", 
-        "group", "holdings", "brands", "international", "global", "solutions",
-        "network", "networks", "enterprises", "energy", "capital", "partners",
-        "mobile", "wireless", "telecom", "communications", "media", "online",
-        "digital", "care", "services", "financial", "management"
-    }
-    for compound in [name, clean_base]:
+    for qualifier in _PARENTHETICAL_RE.findall(raw_name):
+        qualifier = qualifier.strip()
+        # Acronyms only: "(MoMA)", "(CHOP)", "(BLLT)". Category notes such as
+        # "(creamers)" or "(RTD Coffee)" are not surface forms of the entity.
+        is_acronym = 2 <= len(qualifier) <= 10 and qualifier == qualifier.replace(" ", "") and sum(
+            1 for c in qualifier if c.isupper()
+        ) >= 2
+        if is_acronym:
+            terms.add(qualifier)
+
+    for compound in (canonical, base):
         if "-" in compound and not compound.startswith("-"):
-            parts = [
-                p.strip() for p in compound.split("-") 
-                if len(p.strip()) >= 3 and p.lower() not in GENERIC_CATEGORY_WORDS
-            ]
-            for p in parts:
-                aliases.add(p)
-    # Add canonical informal aliases
-    if name.lower() in ("coca-cola", "coca cola"):
-        aliases.add("Coke")
-    raw_text = " ".join([
-        s.get("entity_definition") or "",
-        s.get("validation_prompt") or "",
-        s.get("prominence_prompt") or "",
-    ])
-    for m in re.finditer(r"\(([A-Za-z0-9\s&/-]{2,30})\)", raw_text):
-        cand = m.group(1).strip()
-        if "misspell" in cand.lower():
-            continue
-        if not any(stop in cand.lower() for stop in ["http", "e.g.", "i.e.", "formerly", "including", "such as", "see", "no ", "wire"]):
-            for sub in cand.split(","):
-                sub = sub.strip()
-                if 2 <= len(sub) <= 25 and not sub.lower().startswith("nyse:") and not sub.lower().startswith("nasdaq:") and sub.lower() not in GENERIC_CATEGORY_WORDS:
-                    aliases.add(sub)
-    for m in re.finditer(r"(?i)(?:referred to (?:in media )?as|known as|often called)\s+[\"\'“]?([A-Za-z0-9\s&/-]{2,35})[\"\'”]?", raw_text):
-        cand = m.group(1).strip()
-        if 2 <= len(cand) <= 30:
-            aliases.add(cand)
+            for part in compound.split("-"):
+                part = part.strip()
+                if len(part) >= 3 and part.lower() not in NON_DISTINCTIVE_TOKENS:
+                    terms.add(part)
 
-    for t in s.get("tag_evaluations", []):
-        t_name = t.get("tag_name", "").strip()
-        t_group = (t.get("tag_group_name") or "").lower()
-        if t_name and any(w in t_group for w in ["brand", "group", "subsidiary", "operating unit", name.lower()]):
-            aliases.add(t_name)
+    return sorted({t for t in terms if len(t) >= 2}, key=lambda x: -len(x))
 
-    stop_words = {
-        "the", "group", "and", "all", "article", "company", "no explanation", "no other text",
-        "wire", "mobile", "wireless", "online", "services", "service", "care"
-    }
-    filtered = []
-    for a in sorted(aliases, key=lambda x: -len(x)):
-        if a.lower() not in stop_words and a.lower() not in GENERIC_CATEGORY_WORDS and len(a) >= 2:
-            filtered.append(a)
-    return filtered
+
+def subject_presence_terms(s: dict[str, Any]) -> list[str]:
+    """Strict terms plus the individual distinctive tokens of the label.
+
+    Token-level terms are what let 'Redwire All' match an article about Redwire
+    Corporation without a per-config qualifier list. They over-match on generic words
+    ("Museum", "Free"), so they are only for the advisory presence check, where a hit
+    lowers the validation bar rather than deciding the answer.
+    """
+    canonical = canonical_subject_name(s)
+    if not canonical:
+        return []
+    terms = set(subject_match_terms(s))
+    base = _CORP_SUFFIX_RE.sub("", canonical).strip() or canonical
+    terms.update(
+        t for t in re.findall(r"[\w&'’+.]+", base)
+        if len(t) >= 4 and t.lower() not in NON_DISTINCTIVE_TOKENS
+    )
+    return sorted(terms, key=lambda x: -len(x))
+
+
+def _boundary_patterns(terms: list[str]) -> list[re.Pattern[str]]:
+    return [re.compile(r"\b" + re.escape(term) + r"\b", re.IGNORECASE) for term in terms]
+
+
+def subject_mention_patterns(s: dict[str, Any]) -> list[re.Pattern[str]]:
+    """Word-boundary regexes over the strict terms — use for counting mentions."""
+    return _boundary_patterns(subject_match_terms(s))
+
+
+def subject_presence_patterns(s: dict[str, Any]) -> list[re.Pattern[str]]:
+    """Word-boundary regexes over the widened terms — use for presence evidence."""
+    return _boundary_patterns(subject_presence_terms(s))
 
 
 def build_distilled_article_state(
-    blob_data: dict[str, Any], max_chars: int = 6500
+    blob_data: dict[str, Any], max_chars: int = STATE_MAX_CHARS
 ) -> tuple[str, dict[str, Any]]:
-    """Constructs a high-density, entity-grounded distilled state for Laya decision models.
+    """Laya article state plus the headline/lead entity sets the caller needs.
 
-    Filters boilerplate, resolves corporate aliases, extracts entity-specific excerpts,
-    and enforces headline primacy rules.
+    The state text itself comes from :func:`build_laya_state` so it is byte-identical
+    to what sequence prep produced for training. Boilerplate stripping and per-section
+    caps used to live here; they changed the text the model saw relative to its
+    training distribution, so they are gone.
     """
     inbound = blob_data.get("inbound_data", {})
     headline = inbound.get("headline") or blob_data.get("headline") or ""
-    raw_body = inbound.get("body") or blob_data.get("body") or ""
-    body = strip_boilerplate_and_recirculation(raw_body)
+    body = inbound.get("body") or blob_data.get("body") or ""
     media_type = inbound.get("media_type") or blob_data.get("media_type") or "article"
     source = inbound.get("source") or blob_data.get("source") or ""
     published_at = inbound.get("published_at") or blob_data.get("published_at") or ""
 
-    is_clip = str(media_type).lower() in ("radio", "television", "tv")
-    item_kind = "clip (broadcast transcript)" if is_clip else "written article"
+    distilled_state = build_laya_state(blob_data, max_chars=max_chars)
 
-    # Build map of subjects
     subject_map: dict[str, dict[str, Any]] = {}
     for s in blob_data.get("subjects") or []:
         if s.get("name"):
@@ -189,33 +220,18 @@ def build_distilled_article_state(
         if name and name not in subject_map:
             subject_map[name] = s
 
+    # Lead is the first paragraph, matching the state layout exactly.
     paragraphs = [p.strip() for p in body.split("\n") if p.strip()]
-    total_paras = max(1, len(paragraphs))
-    lead_text = "\n\n".join(paragraphs[:2]) if paragraphs else ""
-    sentences = re.split(r"(?<=[.!?])\s+", body) if body else []
+    lead_text = paragraphs[0] if paragraphs else ""
 
-    # Clean article representation without synthetic entity metrics or extraction artifacts
-    sections = [f"Headline: {headline}\n"]
-    if lead_text:
-        sections.append(f"Lead Paragraph:\n{lead_text[:800]}")
-    
-    # Body sample (excluding lead if already present)
-    remaining_body = body
-    if lead_text and remaining_body.startswith(lead_text):
-        remaining_body = remaining_body[len(lead_text):].strip()
-    if remaining_body:
-        sections.append(f"Article Body:\n{remaining_body[:2800]}")
-
-    distilled_state = "\n\n".join(sections)
-    if len(distilled_state) > max_chars:
-        distilled_state = distilled_state[:max_chars]
-
-    # Identify headline and lead entities for strict primacy enforcement
     hl_entities = set()
     lead_entities = set()
     for s_name, s_dict in subject_map.items():
-        aliases = extract_subject_aliases(s_dict) if s_dict else [s_name]
-        alias_res = [re.compile(r'\b' + re.escape(a) + r'\b', re.IGNORECASE) for a in aliases]
+        alias_res = (
+            subject_mention_patterns(s_dict)
+            if s_dict
+            else [re.compile(r"\b" + re.escape(s_name) + r"\b", re.IGNORECASE)]
+        )
         if any(r.search(headline) for r in alias_res):
             hl_entities.add(s_name)
         if any(r.search(lead_text) for r in alias_res):
@@ -225,7 +241,7 @@ def build_distilled_article_state(
         "media_type": media_type,
         "source": source,
         "published_at": published_at,
-        "is_clip": is_clip,
+        "is_clip": str(media_type).lower() in ("radio", "television", "tv"),
         "body_length": len(body),
         "distilled": True,
         "distilled_chars": len(distilled_state),
@@ -233,42 +249,27 @@ def build_distilled_article_state(
         "lead_entities": list(lead_entities),
     }
     return distilled_state, metadata
+
+
 def convert_config_to_jev_questions(
     snapshot: dict[str, Any],
-    optimized_rubric: dict[str, Any] | None = None,
-    is_system_one: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """Transforms Curation Engine subjects and LLM tags into typed TypeSafe Jev questions.
+    """Deterministically assemble Curation Engine policy into typed Jev questions.
 
-    An optional optimized rubric replaces only the client rule text; canonical labels
-    and question types remain controlled by this converter. For System 1 (Laya), automatically
-    compiles dense, non-truncating criteria when no custom rubric is supplied.
+    This function is the sole raw Jev assembly boundary. Prompt optimization, when
+    requested, operates on its complete returned map rather than feeding rubric
+    fragments back into this converter.
     """
-    from prompt_optimizer import compile_system_one_rubric
-
-    rubric_source = optimized_rubric
-    if is_system_one and not rubric_source:
-        rubric_source = compile_system_one_rubric(snapshot)
-
     questions: dict[str, dict[str, Any]] = {}
     subjects = snapshot.get("subjects", [])
-    optimized_subjects = {
-        str(s.get("subject_id")): s
-        for s in (rubric_source or {}).get("subjects", [])
-    }
 
     for s in subjects:
         s_id = str(s["id"])
         name = s.get("name") or f"Subject {s_id}"
         entity_def = sanitize_heading(s.get("entity_definition") or "")
-        rubric = optimized_subjects.get(s_id) or {}
-        val_prompt = sanitize_heading(rubric.get("validation_criteria") or s.get("validation_prompt") or "")
-        prom_prompt = sanitize_heading(rubric.get("prominence_criteria") or s.get("prominence_prompt") or "")
-        sent_prompt = sanitize_heading(rubric.get("sentiment_criteria") or s.get("sentiment_prompt") or "")
-        optimized_tags = {
-            str(tag.get("tag_id")): tag.get("criteria", "")
-            for tag in rubric.get("tags", [])
-        }
+        val_prompt = sanitize_heading(s.get("validation_prompt") or "")
+        prom_prompt = sanitize_heading(s.get("prominence_prompt") or "")
+        sent_prompt = sanitize_heading(s.get("sentiment_prompt") or "")
 
         # 1. Subject Validation (Noul)
         val_instructions = (
@@ -340,7 +341,7 @@ def convert_config_to_jev_questions(
             if t.get("evaluation_type") == "llm" and t.get("prompt_text"):
                 t_id = t["tag_id"]
                 t_name = t.get("tag_name") or t_id
-                raw_criteria = sanitize_heading(optimized_tags.get(str(t_id)) or t.get("prompt_text") or "")
+                raw_criteria = sanitize_heading(t.get("prompt_text") or "")
                 t_lower = t_name.lower()
                 
                 # Negative guardrail injection for known confusion categories
