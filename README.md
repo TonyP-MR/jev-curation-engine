@@ -278,7 +278,7 @@ flowchart TD
 
     subgraph NB2["02_laya_gpu_training (laya-gpu-training)"]
         direction TB
-        FT[Fine-tune ModernBERT-large<br/>3 epochs, top 8 layers, pos_weight 2.5]
+        FT[Fine-tune ModernBERT-large<br/>3 epochs, top 8 layers<br/>noul + sentiment class weights]
         EVAL{"Accuracy >= 83% gate"}
         PYF[Log MLflow pyfunc<br/>reproduces two-stage gating]
         UC[(Unity Catalog<br/>registered model version)]
@@ -304,6 +304,7 @@ The Azure model hedged on tags. True tags came back at p=0.30 to 0.50 and never 
 * **Base rate learned instead of criteria**: tags were sampled at the production ratio of roughly 85% negative. Notebook 01 downsamples the negatives to the `tag_pos_ratio` widget, default 50/50.
 * **Undertrained**: only one epoch ran, 1,098 optimizer steps across 274 client configurations. Notebook 02 runs three epochs over the top 8 encoder layers.
 * **Symmetric loss**: a missed positive and a missed negative cost the same. Notebook 02 weights the positive class on `noul` heads by `pos_weight`, default 2.5.
+* **Skewed sentiment loss**: neutral is 75% of the sentiment rows while balanced is 1%. Notebook 02 applies mean-one inverse-frequency weights with `sentiment_weight_power`, default 0.5, so minority labels affect training without changing the source data.
 
 The train/validation split is now hashed on `correlation_id` rather than sampled per row. The Azure split put sequences from the same article on both sides, so the 83.33% reported for that run is measured more loosely than the Databricks figures will be, and the two are not directly comparable.
 

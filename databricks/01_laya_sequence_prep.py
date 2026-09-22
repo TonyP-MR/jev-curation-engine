@@ -29,7 +29,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install laya>=0.3.4 transformers>=5.17.0 --quiet
+# MAGIC %pip install laya>=0.3.4 transformers==4.57.6 --quiet
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -196,136 +196,43 @@ print(f"Broadcast {len(config_map)} config snapshots")
 # MAGIC %md
 # MAGIC ## 3. Question conversion helpers
 # MAGIC
-# MAGIC These are the same functions as `backend/question_converter.py`. They are inlined
-# MAGIC so the notebook runs without the repo on the cluster. Keep them in sync when the
-# MAGIC backend prompts change, or install the repo as a wheel and import instead.
+# MAGIC Imported from `laya_questions.py`, the single source of truth shared with the
+# MAGIC backend and the serving wrapper. Deploy that file into this notebook's workspace
+# MAGIC folder alongside the notebooks:
+# MAGIC
+# MAGIC ```bash
+# MAGIC databricks workspace import backend/laya_questions.py \
+# MAGIC   /Users/tony.prime@muckrack.com/laya_curation_engine/laya_questions.py \
+# MAGIC   --format SOURCE --language PYTHON --overwrite
+# MAGIC ```
+# MAGIC
+# MAGIC These functions were previously inlined here and drifted from the backend: the
+# MAGIC served model ended up being asked questions in a shape it was never trained on.
 
 # COMMAND ----------
 
-import re
+import os
+import sys
 from typing import Any
 
-PROMINENCE_MAP = {"primary": 0, "significant": 1, "passing": 2}
-SENTIMENT_MAP = {"positive": 0, "negative": 1, "neutral": 2, "balanced": 3}
-
-GENERIC_CATEGORY_WORDS = {
-    "cola", "systems", "technologies", "software", "foods", "health",
-    "group", "holdings", "brands", "international", "global", "solutions",
-    "network", "networks", "enterprises", "energy", "capital", "partners",
-    "mobile", "wireless", "telecom", "communications", "media", "online",
-    "digital", "care", "services", "financial", "management",
-}
-
-PARTNERSHIP_GUARD = (
-    " Explicit negative exclusion: Standard third-party software compatibility, app store listings, "
-    "operating system integrations, APIs, generic client reviews, and multi-vendor list roundups DO NOT qualify "
-    "as a partnership. A partnership requires an explicit, announced mutual corporate or technology agreement."
+# Workspace files sit next to the notebook; add the folder so `import` finds them.
+_NOTEBOOK_DIR = os.path.dirname(
+    dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
 )
-DEVELOPER_GUARD = (
-    " Explicit negative exclusion: General consumer how-to guides, personal password tips, and general security "
-    "tutorials aimed at everyday end-users DO NOT qualify as Developer content. The content must specifically "
-    "target software engineers, developer tooling, SDKs, or programming workflows."
-)
-AI_GUARD = (
-    " Explicit negative exclusion: Passing biographical mentions in author blurbs, routine automation, "
-    "or generic software algorithms DO NOT qualify. The content must substantively discuss artificial intelligence "
-    "or machine learning directly related to the subject."
+for _candidate in (f"/Workspace{_NOTEBOOK_DIR}", _NOTEBOOK_DIR):
+    if _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+
+from laya_questions import (  # noqa: E402
+    HEAD_MAX_LEN,
+    MAX_LEN,
+    PROMINENCE_MAP,
+    SENTIMENT_MAP,
+    build_laya_questions,
+    build_laya_state,
 )
 
-
-def sanitize_heading(text: str) -> str:
-    return "\n".join(re.sub(r"^#+\s*", "", line) for line in (text or "").splitlines()).strip()
-
-
-def tag_guardrail(tag_name: str) -> str:
-    lowered = tag_name.lower()
-    if any(w in lowered for w in ("partnership", "partner", "alliance", "joint venture")):
-        return PARTNERSHIP_GUARD
-    if any(w in lowered for w in ("developer", "devops", "engineering")):
-        return DEVELOPER_GUARD
-    if lowered == "ai" or "artificial intelligence" in lowered:
-        return AI_GUARD
-    return ""
-
-
-def convert_config_to_questions(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    questions: dict[str, dict[str, Any]] = {}
-    for s in snapshot.get("subjects", []):
-        s_id = str(s["id"])
-        name = s.get("name") or f"Subject {s_id}"
-
-        questions[f"subj_{s_id}_valid"] = {
-            "type": "noul",
-            "instructions": (
-                f"Is the provided content meaningfully relevant to '{name}' based on the validation criteria?"
-            ),
-            "criteria": {
-                "true": f"Content satisfies validation criteria for {name}: "
-                        f"{sanitize_heading(s.get('validation_prompt') or '')[:600]}",
-                "false": f"Content is unrelated, passing mention without substance, or fails validation "
-                         f"criteria for {name}.",
-            },
-        }
-
-        questions[f"subj_{s_id}_prominence"] = {
-            "type": "choice",
-            "instructions": (
-                f"What is the prominence of '{name}' in this content? "
-                f"Return exactly one API choice: primary, significant, or passing."
-            ),
-            "criteria": {
-                "primary": f"Primary dominant focus of the article. {name} is the central subject "
-                           f"featured in the headline, lead, and narrative.",
-                "significant": f"Key topic discussed substantively, or featured in the headline or lead. "
-                               f"Not for incidental mentions in multi-vendor lists.",
-                "passing": f"Incidental reference: {name} appears in a list of companies, is cited as a "
-                           f"secondary data source, or is mentioned briefly without headline focus.",
-            },
-        }
-
-        questions[f"subj_{s_id}_sentiment"] = {
-            "type": "choice",
-            "instructions": (
-                f"What is the specific tone and sentiment towards '{name}' in this content? "
-                f"Isolate sentiment strictly to '{name}'."
-            ),
-            "criteria": {
-                "positive": f"Explicit institutional praise, awards, or celebratory acclaim directed at {name}.",
-                "negative": f"Direct adverse coverage, criticism, scandal, litigation, or severe failure "
-                            f"directed at {name}.",
-                "neutral": f"Editorial baseline: factual reporting, earnings, operational transactions, "
-                           f"executive hires, and routine industry news regarding {name}.",
-                "balanced": f"Substantial elements of both explicit praise and severe criticism regarding {name}.",
-            },
-        }
-
-        for t in s.get("tag_evaluations", []):
-            if t.get("evaluation_type") != "llm" or not t.get("prompt_text"):
-                continue
-            t_id = t["tag_id"]
-            t_name = t.get("tag_name") or t_id
-            criteria_text = sanitize_heading(t.get("prompt_text") or "") + tag_guardrail(t_name)
-            questions[f"tag_{s_id}_{t_id}"] = {
-                "type": "noul",
-                "instructions": f"Does the content match the tag criteria for '{t_name}' regarding '{name}'?",
-                "criteria": {
-                    "true": f"Criteria satisfied for {t_name}: {criteria_text.strip()}",
-                    "false": f"Criteria NOT satisfied for {t_name}.",
-                },
-            }
-
-    return questions
-
-
-def build_state(blob: dict[str, Any], max_chars: int = 4000) -> str:
-    inbound = blob.get("inbound_data") or {}
-    headline = inbound.get("headline") or blob.get("headline") or ""
-    body = inbound.get("body") or blob.get("body") or ""
-    paragraphs = [p.strip() for p in body.split("\n") if p.strip()]
-    lead = paragraphs[0] if paragraphs else ""
-    rest = "\n\n".join(paragraphs[1:])
-    state = f"Headline: {headline}\n\n\nLead Paragraph:\n{lead}\n\nArticle Body:\n{rest}"
-    return state[:max_chars]
+print(f"Loaded canonical prompts: {len(build_laya_questions({'subjects': []}))} questions for an empty config")
 
 # COMMAND ----------
 
@@ -357,9 +264,13 @@ _TOKENIZER_CACHE: dict[str, Any] = {}
 
 
 def get_tokenizer():
-    """Loads the Laya tokenizer once per executor process."""
+    """Loads the Laya tokenizer once per executor process.
+
+    Budgets come from `laya_questions`, not the checkpoint config, so prep, training
+    and serving cannot tokenize at different widths.
+    """
     if "tok" in _TOKENIZER_CACHE:
-        return _TOKENIZER_CACHE["tok"], _TOKENIZER_CACHE["max_len"], _TOKENIZER_CACHE["head_max_len"]
+        return _TOKENIZER_CACHE["tok"], MAX_LEN, HEAD_MAX_LEN
 
     import os
     from huggingface_hub import snapshot_download
@@ -371,13 +282,8 @@ def get_tokenizer():
     _fix_tokenizer_config(model_dir)
 
     tok = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
-    with open(os.path.join(model_dir, "rl_agent_config.json")) as f:
-        cfg = json.load(f)
-
     _TOKENIZER_CACHE["tok"] = tok
-    _TOKENIZER_CACHE["max_len"] = cfg.get("max_len", 1024)
-    _TOKENIZER_CACHE["head_max_len"] = cfg.get("head_max_len", 256)
-    return tok, _TOKENIZER_CACHE["max_len"], _TOKENIZER_CACHE["head_max_len"]
+    return tok, MAX_LEN, HEAD_MAX_LEN
 
 
 def build_sequences_partition(rows):
@@ -398,8 +304,8 @@ def build_sequences_partition(rows):
         if not snapshot:
             continue
 
-        questions = convert_config_to_questions(snapshot)
-        state_text = build_state(blob)
+        questions = build_laya_questions(snapshot)
+        state_text = build_laya_state(blob)
         corr_id = blob.get("correlation_id")
 
         def emit(qid, kind, q_def, target, label):

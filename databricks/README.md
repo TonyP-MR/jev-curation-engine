@@ -9,7 +9,9 @@ Moves Laya training off the single Azure Tesla T4 VM (`dev-002`) and onto the
 |---|---|
 | `01_laya_sequence_prep.py` | Ingests audit blobs and config snapshots, builds tokenized typed-decision sequences with Spark, rebalances the tag class, writes `muckrack_data.laya.training_sequences` |
 | `02_laya_gpu_training.py` | Fine-tunes ModernBERT-large on those sequences, logs to MLflow, registers the weights in Unity Catalog |
+| `03_recover_and_publish.py` | Repackages a qualifying run's best-epoch checkpoint if publication failed; it rechecks the complete metric gate before registration |
 | `cluster_laya_gpu.json` | Single-node `g5.xlarge` (A10G, 24 GB) GPU cluster spec |
+| `cluster_laya_gpu_4x.json` | Single-node `g5.12xlarge` four-GPU retraining cluster spec |
 | `ruff.toml` | Silences F821 for the Databricks runtime globals |
 
 ## Workspace
@@ -18,7 +20,7 @@ Moves Laya training off the single Azure Tesla T4 VM (`dev-002`) and onto the
 - Account: `tony.prime@muckrack.com`
 - Catalog: `muckrack_data`, schema `laya` (created by notebook 01)
 - Notebooks: `/Users/tony.prime@muckrack.com/laya_curation_engine/`
-- Cluster: `laya-gpu-training` (`0921-091413-skcrybyo`)
+- Four-GPU cluster: `laya-gpu-training-4x` (`0921-112024-wfa33o5s`)
 
 ## CLI setup
 
@@ -57,8 +59,9 @@ is the better choice once the pipeline is scheduled.
 
 1. Attach `01_laya_sequence_prep` to any CPU cluster. Set `blobs_limit` to a few
    hundred for a first pass, then 0 for everything.
-2. Attach `02_laya_gpu_training` to `laya-gpu-training` and run. Defaults are 3
-   epochs, top 8 encoder layers, positive class weight 2.5.
+2. Attach `02_laya_gpu_training` to `laya-gpu-training-4x`, set `num_gpus=4`,
+   and run. Defaults are 3 epochs, top 8 encoder layers, positive `noul` class
+   weight 2.5, and sentiment inverse-frequency power 0.5.
 3. Open the MLflow experiment at `/Users/tony.prime@muckrack.com/laya_training`
    to compare against earlier runs.
 
@@ -75,6 +78,9 @@ almost every tag as false. Three causes, each addressed here:
   Notebook 02 runs three.
 - Loss treated a missed positive and a missed negative the same. Notebook 02
   weights the positive class on `noul` heads by `pos_weight`.
+- Sentiment is 75% neutral and 1% balanced. Notebook 02 applies mean-one
+  inverse-frequency weights to sentiment labels and derives the `noul` type ID
+  from Laya instead of accidentally weighting choice label 1.
 
 The train/validation split is hashed on `correlation_id` rather than sampled per
 row. The Azure split put sequences from the same article on both sides, so the
@@ -89,6 +95,12 @@ validation questions run first, and prominence, sentiment and tag questions are
 only asked about subjects that passed. Subjects that failed get the same
 hard-coded defaults the local runner applies, so a served answer and a local
 answer agree for the same input.
+
+The normal subject validation gate is 0.45 in the local runner and served
+wrapper. Registration requires nonzero validation, prominence, sentiment, and
+tag samples plus aggregate accuracy of at least 83%. The notebook restores the
+lowest-validation-loss epoch before packaging and records exact runtime package
+versions, including CloudPickle, in the pyfunc environment.
 
 The response envelope matches the Azure service, which is what lets the rig
 treat both as interchangeable engines.
@@ -141,7 +153,21 @@ and endpoints. Order matters: `laya:databricks:local` is checked before
 
 ## Keeping the prompts in sync
 
-Notebook 01 inlines the question-building logic from
-`backend/question_converter.py` so the cluster does not need the repo. When the
-backend prompts change, either update the notebook or package `backend/` as a
-wheel and import it instead. The wheel is the better long-term answer.
+`backend/laya_questions.py` is the single source of truth for the state string, the
+typed-decision questions and the sequence budgets (`MAX_LEN` 1024, `HEAD_MAX_LEN`
+256, taken from the checkpoint's `rl_agent_config.json`). Notebooks 01, 02 and 03
+import it, the backend imports it, and notebook 02/03 package it into the served
+model with `code_paths`, so prep, training and serving cannot drift.
+
+Deploy it next to the notebooks whenever it changes:
+
+```bash
+databricks workspace import \
+  /Users/tony.prime@muckrack.com/laya_curation_engine/laya_questions.py \
+  --file backend/laya_questions.py --format AUTO --overwrite
+```
+
+It was previously inlined in notebook 01 and reimplemented twice more in the
+backend. The three copies diverged: the served model was asked LLM-style prompts
+with rule prose it cannot act on, at a 2048/384 budget it was never trained at,
+while the weights had learned short criteria at 1024/256.

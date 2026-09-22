@@ -13,16 +13,17 @@ from transformers import AutoTokenizer
 
 from config import settings
 from config_manager import config_manager
-from question_converter import (
-    build_distilled_article_state,
-    convert_config_to_jev_questions,
+from laya_questions import (
+    HEAD_MAX_LEN,
+    MAX_LEN,
+    PROMINENCE_MAP,
+    SENTIMENT_MAP,
+    build_laya_questions,
+    build_laya_state,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
-
-PROMINENCE_MAP = {"primary": 0, "significant": 1, "passing": 2}
-SENTIMENT_MAP = {"positive": 0, "negative": 1, "neutral": 2, "balanced": 3}
 
 
 def build_curation_engine_dataset(
@@ -51,8 +52,15 @@ def build_curation_engine_dataset(
     with open(os.path.join(model_dir, "rl_agent_config.json")) as f:
         cfg = json.load(f)
 
-    max_len = cfg.get("max_len", 1024)
-    head_max_len = cfg.get("head_max_len", 256)
+    # Budgets are fixed by the canonical module, not read from the checkpoint, so a
+    # config change cannot silently retrain at a width serving does not use.
+    max_len = MAX_LEN
+    head_max_len = HEAD_MAX_LEN
+    if (cfg.get("max_len"), cfg.get("head_max_len")) != (max_len, head_max_len):
+        logger.warning(
+            "Checkpoint cfg budgets %s/%s differ from canonical %s/%s; building at canonical.",
+            cfg.get("max_len"), cfg.get("head_max_len"), max_len, head_max_len,
+        )
 
     blobs_pattern = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", ".cache", "production", "blobs", "*.json")
@@ -93,8 +101,8 @@ def build_curation_engine_dataset(
             continue
 
         snapshot = cfg_cache[cfg_id]["snapshot"]
-        questions = convert_config_to_jev_questions(snapshot)
-        state_text, _ = build_distilled_article_state(blob)
+        questions = build_laya_questions(snapshot)
+        state_text = build_laya_state(blob)
 
         # 1. Subject-level ground truth (validation, prominence, sentiment)
         subj_results = blob.get("subject_results") or []

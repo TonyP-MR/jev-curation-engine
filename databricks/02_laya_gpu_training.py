@@ -27,7 +27,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install laya>=0.3.4 transformers>=5.17.0 safetensors --quiet
+# MAGIC %pip install laya>=0.3.4 transformers==4.57.6 safetensors --quiet
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -40,6 +40,11 @@ dbutils.widgets.text("grad_accum", "4", "Gradient accumulation")
 dbutils.widgets.text("lr", "3.5e-5", "Learning rate")
 dbutils.widgets.text("top_layers", "8", "Trainable encoder layers")
 dbutils.widgets.text("pos_weight", "2.5", "Positive class weight (noul heads)")
+dbutils.widgets.text(
+    "sentiment_weight_power",
+    "0.5",
+    "Inverse-frequency power for sentiment class weights",
+)
 dbutils.widgets.text("num_gpus", "1", "GPUs")
 dbutils.widgets.text("model_name", "laya_typed_decisions", "Registered model name")
 dbutils.widgets.text("serving_endpoint", "laya-curation-engine", "Serving endpoint (blank to skip)")
@@ -52,6 +57,7 @@ GRAD_ACCUM = int(dbutils.widgets.get("grad_accum"))
 LR = float(dbutils.widgets.get("lr"))
 TOP_LAYERS = int(dbutils.widgets.get("top_layers"))
 POS_WEIGHT = float(dbutils.widgets.get("pos_weight"))
+SENTIMENT_WEIGHT_POWER = float(dbutils.widgets.get("sentiment_weight_power"))
 NUM_GPUS = int(dbutils.widgets.get("num_gpus"))
 MODEL_NAME = dbutils.widgets.get("model_name")
 
@@ -81,6 +87,7 @@ else:
 # COMMAND ----------
 
 import os
+
 from pyspark.sql import functions as F
 
 STAGING_DIR = "/local_disk0/laya_training"
@@ -89,6 +96,21 @@ os.makedirs(STAGING_DIR, exist_ok=True)
 sequences = spark.table(SEQUENCES_TABLE)
 train_pd = sequences.filter(F.col("split") == "train").toPandas()
 val_pd = sequences.filter(F.col("split") == "val").toPandas()
+
+EXPECTED_DECISION_KINDS = ("validation", "prominence", "sentiment", "tag")
+val_kind_counts = {
+    kind: int((val_pd["decision_kind"] == kind).sum())
+    for kind in EXPECTED_DECISION_KINDS
+}
+missing_val_kinds = [
+    kind for kind, count in val_kind_counts.items() if count == 0
+]
+if missing_val_kinds:
+    raise RuntimeError(
+        "Validation data is missing expected decision kinds: "
+        + ", ".join(missing_val_kinds)
+    )
+print(f"Validation decision-kind counts: {val_kind_counts}")
 
 print(f"Train: {len(train_pd)} sequences")
 print(f"Val:   {len(val_pd)} sequences")
@@ -132,9 +154,11 @@ print(f"Staged tensors to {STAGING_DIR}")
 train_fn_source = '''
 import contextlib
 import json
+from collections import Counter
 import logging
 import os
 import random
+import math
 import time
 
 import mlflow
@@ -147,23 +171,91 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("laya_databricks")
 
+EXPECTED_DECISION_KINDS = ("validation", "prominence", "sentiment", "tag")
 
-def evaluate(model, items, pad_token_id, device, batch_size=16, max_items=600):
-    """Returns overall and per-kind accuracy plus raw logits for temperature fitting."""
+
+def log_evaluation_metrics(prefix, evaluation, step=None):
+    metrics = {
+        f"{prefix}_accuracy_pct": evaluation["overall_accuracy_pct"],
+        f"{prefix}_loss": evaluation["loss"],
+    }
+    for kind in EXPECTED_DECISION_KINDS:
+        metrics[f"{prefix}_{kind}_count"] = evaluation["counts"][kind]
+        metrics[f"{prefix}_{kind}_accuracy_pct"] = evaluation["by_kind"][kind]
+    for label_key, accuracy in evaluation.get("by_label", {}).items():
+        metrics[f"{prefix}_label_{label_key}_count"] = evaluation["counts_by_label"][label_key]
+        metrics[f"{prefix}_label_{label_key}_accuracy_pct"] = accuracy
+    mlflow.log_metrics(metrics, step=step)
+
+
+def evaluate(model, items, pad_token_id, device, batch_size=16, max_items=600, seed=123):
+    """Returns complete stratified accuracy, counts, loss, and calibration logits."""
     from laya.common import collate_items
 
     model.eval()
 
-    # Stratify. `items[:max_items]` drew only tags, because the sequences come
-    # back grouped by decision_kind, so every reported accuracy was tag-only
-    # while claiming to cover all four kinds - and the registration gate was
-    # judged on it. Take an even share of each kind instead.
-    by_kind = {}
-    for it in items:
-        by_kind.setdefault(it["decision_kind"], []).append(it)
-    per_kind = max(1, max_items // max(1, len(by_kind)))
-    subset = [it for kind_items in by_kind.values() for it in kind_items[:per_kind]]
-    correct_by_kind, total_by_kind = {}, {}
+    # `items[:max_items]` sampled only tags because the table is grouped by kind.
+    # Take an even, explicitly ordered share of every required kind instead.
+    items_by_kind = {kind: [] for kind in EXPECTED_DECISION_KINDS}
+    for item in items:
+        kind = item["decision_kind"]
+        if kind in items_by_kind:
+            items_by_kind[kind].append(item)
+    missing = [
+        kind for kind, kind_items in items_by_kind.items() if not kind_items
+    ]
+    if missing:
+        raise RuntimeError(
+            "Evaluation is missing expected decision kinds: " + ", ".join(missing)
+        )
+
+    # Sequences are read back from a Delta table written as a union of
+    # per-(kind, label) windows, so table order is still coarsely grouped by
+    # label within each kind even though notebook 01 shuffled inside each
+    # window. Taking `items_by_kind[kind][:per_kind]` without reshuffling can
+    # therefore draw a near-single-label prefix — for a 4-way head like
+    # sentiment (74.9% neutral, 1.1% balanced in training) that makes the
+    # reported accuracy close to noise and unstable across runs. Shuffle with
+    # a fixed seed and take an even share per label so the sample is both
+    # representative and reproducible across pre/post-train comparisons.
+    per_kind = max(1, max_items // len(EXPECTED_DECISION_KINDS))
+    rng = random.Random(seed)
+    subset = []
+    for kind in EXPECTED_DECISION_KINDS:
+        by_label: dict[int, list] = {}
+        for item in items_by_kind[kind]:
+            by_label.setdefault(item["label"], []).append(item)
+        labels = sorted(by_label)
+        for label_items in by_label.values():
+            rng.shuffle(label_items)
+
+        per_label = max(1, per_kind // len(labels))
+        kind_subset: list = []
+        for label in labels:
+            kind_subset.extend(by_label[label][:per_label])
+
+        # Labels with fewer than `per_label` examples leave the quota short.
+        # Top up from whatever is left, largest pools first, so `per_kind` is
+        # still hit without re-biasing toward the majority label up front.
+        if len(kind_subset) < per_kind:
+            leftovers = sorted(
+                (by_label[label][per_label:] for label in labels),
+                key=len,
+                reverse=True,
+            )
+            for pool in leftovers:
+                for item in pool:
+                    if len(kind_subset) >= per_kind:
+                        break
+                    kind_subset.append(item)
+                if len(kind_subset) >= per_kind:
+                    break
+
+        subset.extend(kind_subset[:per_kind])
+    correct_by_kind = {kind: 0 for kind in EXPECTED_DECISION_KINDS}
+    total_by_kind = {kind: 0 for kind in EXPECTED_DECISION_KINDS}
+    correct_by_label: dict[tuple[str, int], int] = {}
+    total_by_label: dict[tuple[str, int], int] = {}
     total_loss, n_batches = 0.0, 0
     logits_by_type = {0: [], 1: [], 2: []}
 
@@ -190,26 +282,48 @@ def evaluate(model, items, pad_token_id, device, batch_size=16, max_items=600):
             preds = masked.argmax(-1)
             matches = (preds == labels).cpu().numpy()
 
-            for it, match, qt, logit_row, targ_row, mmask in zip(
+            for item, match, qt, logit_row, targ_row, mmask in zip(
                 chunk, matches, qtype.cpu().numpy(), logits.cpu().numpy(),
                 target.cpu().numpy(), marker_mask.cpu().numpy(),
             ):
-                kind = it["decision_kind"]
-                total_by_kind[kind] = total_by_kind.get(kind, 0) + 1
-                correct_by_kind[kind] = correct_by_kind.get(kind, 0) + int(match)
+                kind = item["decision_kind"]
+                total_by_kind[kind] += 1
+                correct_by_kind[kind] += int(match)
+                label_key = (kind, int(item["label"]))
+                total_by_label[label_key] = total_by_label.get(label_key, 0) + 1
+                correct_by_label[label_key] = correct_by_label.get(label_key, 0) + int(match)
                 k = int(mmask.sum())
                 logits_by_type[int(qt)].append((logit_row[:k].tolist(), targ_row[:k].tolist()))
 
-    by_kind = {
-        k: round(correct_by_kind.get(k, 0) / v * 100, 2)
-        for k, v in total_by_kind.items()
+    missing = [
+        kind for kind, count in total_by_kind.items() if count == 0
+    ]
+    if missing:
+        raise RuntimeError(
+            "Evaluation produced zero samples for expected decision kinds: "
+            + ", ".join(missing)
+        )
+
+    accuracy_by_kind = {
+        kind: round(correct_by_kind[kind] / total_by_kind[kind] * 100, 2)
+        for kind in EXPECTED_DECISION_KINDS
+    }
+    accuracy_by_label = {
+        f"{kind}_{label}": round(correct_by_label[(kind, label)] / total_by_label[(kind, label)] * 100, 2)
+        for kind, label in total_by_label
+    }
+    counts_by_label = {
+        f"{kind}_{label}": count for (kind, label), count in total_by_label.items()
     }
     total_correct = sum(correct_by_kind.values())
     total_seen = sum(total_by_kind.values())
     model.train()
     return {
-        "overall_accuracy_pct": round(total_correct / max(1, total_seen) * 100, 2),
-        "by_kind": by_kind,
+        "overall_accuracy_pct": round(total_correct / total_seen * 100, 2),
+        "by_kind": accuracy_by_kind,
+        "by_label": accuracy_by_label,
+        "counts": total_by_kind,
+        "counts_by_label": counts_by_label,
         "loss": total_loss / max(1, n_batches),
         "raw_logits_by_type": logits_by_type,
     }
@@ -272,9 +386,40 @@ def train():
         raise
 
 
+def build_sentiment_class_weights(items, power):
+    """Returns mean-one inverse-frequency weights for the four sentiment labels."""
+    if not 0.0 <= power <= 1.0:
+        raise ValueError("sentiment_weight_power must be between 0.0 and 1.0")
+    counts = Counter(
+        int(item["label"])
+        for item in items
+        if item["decision_kind"] == "sentiment"
+    )
+    missing = [label for label in range(4) if counts[label] == 0]
+    if missing:
+        raise RuntimeError(
+            "Sentiment training data is missing labels: "
+            + ", ".join(str(label) for label in missing)
+        )
+
+    largest_class = max(counts.values())
+    raw_weights = {
+        label: (largest_class / counts[label]) ** power
+        for label in range(4)
+    }
+    normalizer = sum(
+        counts[label] * raw_weights[label] for label in range(4)
+    ) / sum(counts.values())
+    weights = {
+        label: raw_weights[label] / normalizer
+        for label in range(4)
+    }
+    return dict(counts), weights
+
+
 def _train_impl():
     import laya
-    from laya.common import collate_items
+    from laya.common import QTYPES, collate_items
     from safetensors.torch import save_file
 
     staging_dir = os.environ["LAYA_STAGING_DIR"]
@@ -285,6 +430,7 @@ def _train_impl():
     lr = float(os.environ["LAYA_LR"])
     top_layers = int(os.environ["LAYA_TOP_LAYERS"])
     pos_weight = float(os.environ["LAYA_POS_WEIGHT"])
+    sentiment_weight_power = float(os.environ["LAYA_SENTIMENT_WEIGHT_POWER"])
     run_id = os.environ["LAYA_MLFLOW_RUN_ID"]
 
     # TorchDistributor launches this through torchrun, which sets these. Running
@@ -304,6 +450,16 @@ def _train_impl():
 
     train_items = torch.load(f"{staging_dir}/train_items.pt", weights_only=False)
     val_items = torch.load(f"{staging_dir}/val_items.pt", weights_only=False)
+    sentiment_counts, sentiment_class_weights = build_sentiment_class_weights(
+        train_items,
+        sentiment_weight_power,
+    )
+    noul_qtype = int(QTYPES["noul"])
+    if is_chief:
+        logger.info(
+            f"Sentiment class counts: {sentiment_counts} | "
+            f"weights: {sentiment_class_weights}"
+        )
 
     # Every rank must take the same number of optimizer steps or NCCL deadlocks
     # waiting for a gradient all-reduce that never arrives. Truncating to a
@@ -333,10 +489,12 @@ def _train_impl():
     with mlflow_ctx:
         pre = evaluate(model, val_items, tok.pad_token_id, device) if is_chief else None
         if is_chief:
-            logger.info(f"Pre-training accuracy: {pre['overall_accuracy_pct']}% | {pre['by_kind']}")
-            mlflow.log_metric("pre_train_accuracy_pct", pre["overall_accuracy_pct"])
-            for kind, acc in pre["by_kind"].items():
-                mlflow.log_metric(f"pre_train_accuracy_{kind}", acc)
+            logger.info(
+                f"Pre-training accuracy: {pre['overall_accuracy_pct']}% | "
+                f"counts={pre['counts']} | accuracy={pre['by_kind']} | "
+                f"by_label={pre['by_label']} (counts={pre['counts_by_label']})"
+            )
+            log_evaluation_metrics("pre_train", pre)
 
         for param in model.encoder.parameters():
             param.requires_grad = False
@@ -358,6 +516,16 @@ def _train_impl():
             mlflow.log_param("trainable_params", trainable_count)
             mlflow.log_param("total_params", total_count)
             mlflow.log_param("world_size", world_size)
+            mlflow.log_param("sentiment_weight_power", sentiment_weight_power)
+            for label in range(4):
+                mlflow.log_param(
+                    f"sentiment_label_{label}_count",
+                    sentiment_counts[label],
+                )
+                mlflow.log_param(
+                    f"sentiment_label_{label}_weight",
+                    round(sentiment_class_weights[label], 6),
+                )
 
         model.train()
 
@@ -428,11 +596,31 @@ def _train_impl():
                         masked = logits.masked_fill(~marker_mask, -1e4)
                         per_sample = -(target * torch.log_softmax(masked, -1)).sum(-1)
 
-                        # Weight the positive class on noul questions. qtype 0 is noul, and
-                        # index 1 of the target is the "true" option.
-                        is_noul = (qtype == 0)
-                        is_positive = (target.argmax(-1) == 1)
-                        weights = torch.where(is_noul & is_positive, pos_weight, 1.0).to(per_sample.dtype)
+                        # `laya.common.QTYPES` maps noul to 2. Weight its positive
+                        # option without accidentally weighting label 1 on choice
+                        # questions (prominence and sentiment).
+                        is_noul = qtype == noul_qtype
+                        is_positive = target.argmax(-1) == 1
+                        weights = torch.where(
+                            is_noul & is_positive,
+                            pos_weight,
+                            1.0,
+                        ).to(per_sample.dtype)
+
+                        # Sentiment is 75% neutral and only 1% balanced. Mean-one
+                        # inverse-sqrt frequency weights preserve the average
+                        # gradient scale while giving the minority labels signal.
+                        sentiment_weights = torch.tensor(
+                            [
+                                sentiment_class_weights[int(item["label"])]
+                                if item["decision_kind"] == "sentiment"
+                                else 1.0
+                                for item in chunk
+                            ],
+                            dtype=per_sample.dtype,
+                            device=device,
+                        )
+                        weights = weights * sentiment_weights
                         loss_ce = (per_sample * weights).sum() / weights.sum()
                         loss = loss_ce / grad_accum + 0.0 * act.sum()
 
@@ -460,14 +648,17 @@ def _train_impl():
             if is_chief:
                 epoch_eval = evaluate(model, val_items, tok.pad_token_id, device)
                 logger.info(
-                    f"Epoch {epoch + 1}/{epochs} | train loss {running_loss / max(1, n_batches):.4f} | "
-                    f"val {epoch_eval['overall_accuracy_pct']}% | {epoch_eval['by_kind']}"
+                    f"Epoch {epoch + 1}/{epochs} | "
+                    f"train loss {running_loss / max(1, n_batches):.4f} | "
+                    f"val {epoch_eval['overall_accuracy_pct']}% | "
+                    f"counts={epoch_eval['counts']} | accuracy={epoch_eval['by_kind']}"
                 )
-                mlflow.log_metric("epoch_train_loss", running_loss / max(1, n_batches), step=epoch + 1)
-                mlflow.log_metric("epoch_val_accuracy_pct", epoch_eval["overall_accuracy_pct"], step=epoch + 1)
-                mlflow.log_metric("epoch_val_loss", epoch_eval["loss"], step=epoch + 1)
-                for kind, acc in epoch_eval["by_kind"].items():
-                    mlflow.log_metric(f"epoch_val_accuracy_{kind}", acc, step=epoch + 1)
+                mlflow.log_metric(
+                    "epoch_train_loss",
+                    running_loss / max(1, n_batches),
+                    step=epoch + 1,
+                )
+                log_evaluation_metrics("epoch_val", epoch_eval, step=epoch + 1)
 
                 # Keep the best epoch, not the last one. Validation loss rose
                 # after epoch 1 on the first real run while training loss kept
@@ -501,10 +692,14 @@ def _train_impl():
             logger.info(f"Restored epoch {best_epoch} (val loss {best_val_loss:.4f}) for saving")
 
         post = evaluate(model, val_items, tok.pad_token_id, device)
-        logger.info(f"Post-training accuracy: {post['overall_accuracy_pct']}% | {post['by_kind']}")
-        mlflow.log_metric("post_train_accuracy_pct", post["overall_accuracy_pct"])
-        for kind, acc in post["by_kind"].items():
-            mlflow.log_metric(f"post_train_accuracy_{kind}", acc)
+        logger.info(
+            f"Post-training accuracy: {post['overall_accuracy_pct']}% | "
+            f"counts={post['counts']} | accuracy={post['by_kind']} | "
+            f"by_label={post['by_label']} (counts={post['counts_by_label']})"
+        )
+        log_evaluation_metrics("post_train", post)
+        mlflow.log_metric("best_epoch", best_epoch)
+        mlflow.log_metric("best_val_loss", best_val_loss)
         mlflow.log_metric("training_minutes", round(duration / 60, 2))
 
         temps = fit_temperature(post["raw_logits_by_type"])
@@ -519,6 +714,8 @@ def _train_impl():
         cfg["trained_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as f:
             json.dump(cfg, f, indent=2)
+        with open(os.path.join(output_dir, "training_run_id.txt"), "w") as f:
+            f.write(run_id)
 
         tok_dir = os.path.join(output_dir, "tokenizer")
         os.makedirs(tok_dir, exist_ok=True)
@@ -532,13 +729,21 @@ def _train_impl():
             "pre_train_accuracy_pct": pre["overall_accuracy_pct"],
             "post_train_accuracy_pct": post["overall_accuracy_pct"],
             "by_kind": post["by_kind"],
+            "counts": post["counts"],
+            "by_label": post["by_label"],
+            "counts_by_label": post["counts_by_label"],
             "temperature": temps,
             "training_minutes": round(duration / 60, 2),
             "output_dir": output_dir,
             "world_size": world_size,
             "best_epoch": best_epoch,
             "best_val_loss": round(best_val_loss, 4),
+            "sentiment_class_counts": sentiment_counts,
+            "sentiment_class_weights": sentiment_class_weights,
+            "sentiment_weight_power": sentiment_weight_power,
         }
+        with open(os.path.join(output_dir, "training_summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
 
     if is_distributed:
         # Released after the checkpoint is on disk so no rank exits early and
@@ -575,11 +780,43 @@ print("Wrote training function to /local_disk0/laya_train_fn.py")
 # `import json` further up lives inside the training-function source string,
 # so it never lands in the notebook namespace.
 import json
+import os
+import shutil
+import sys
+import time
+from importlib.metadata import version as package_version
 
 import mlflow
 import pandas as pd
 from mlflow.models import ModelSignature
 from mlflow.types import ColSpec, Schema
+
+# `laya_questions.py` is deployed next to the notebooks (see notebook 01) and is
+# packaged into the served model so the wrapper and the training sequences agree on
+# budgets.
+_NOTEBOOK_DIR = os.path.dirname(
+    dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+)
+for _candidate in (f"/Workspace{_NOTEBOOK_DIR}", _NOTEBOOK_DIR):
+    if _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+
+import laya_questions
+
+LAYA_QUESTIONS_PATH = laya_questions.__file__
+PACKAGED_LAYA_QUESTIONS_PATH = "/local_disk0/laya_questions.py"
+shutil.copyfile(LAYA_QUESTIONS_PATH, PACKAGED_LAYA_QUESTIONS_PATH)
+SERVING_REQUIREMENTS = [
+    f"{package}=={package_version(package)}"
+    for package in (
+        "cloudpickle",
+        "laya",
+        "torch",
+        "transformers",
+        "safetensors",
+    )
+]
+print(f"Exact serving requirements: {SERVING_REQUIREMENTS}")
 
 PASSING_PROMINENCE = {
     "type": "choice",
@@ -597,18 +834,21 @@ FALSE_TAG = {"type": "noul", "noul": 0.0, "confidence": 1.0}
 
 # Matches VALIDATION_THRESHOLD in backend/config.py. Gating on a different
 # number here would make served and local answers disagree.
-VALIDATION_GATE = 0.50
+VALIDATION_GATE = 0.45
 
 
 class LayaDecisionModel(mlflow.pyfunc.PythonModel):
     def load_context(self, context):
         import laya
         import torch
+        from laya_questions import HEAD_MAX_LEN, MAX_LEN
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.agent = laya.load(context.artifacts["checkpoint"], device=device)
-        self.agent.cfg["max_len"] = 2048
-        self.agent.cfg["head_max_len"] = 384
+        # Serve at the budget the sequences were built and trained at. Serving wider
+        # (this was 2048/384) shifts where truncation lands relative to training.
+        self.agent.cfg["max_len"] = MAX_LEN
+        self.agent.cfg["head_max_len"] = HEAD_MAX_LEN
 
     def _decide(self, state, questions):
         val_questions = {k: v for k, v in questions.items() if k.endswith("_valid")}
@@ -702,8 +942,16 @@ experiment_path = f"/Users/{spark.sql('SELECT current_user()').collect()[0][0]}/
 mlflow.set_experiment(experiment_path)
 
 OUTPUT_DIR = "/local_disk0/laya_checkpoint"
+SUMMARY_PATH = os.path.join(OUTPUT_DIR, "training_summary.json")
+shutil.rmtree(OUTPUT_DIR, ignore_errors=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-with mlflow.start_run(run_name=f"laya-{EPOCHS}ep-top{TOP_LAYERS}-pw{POS_WEIGHT}") as run:
+with mlflow.start_run(
+    run_name=(
+        f"laya-{EPOCHS}ep-top{TOP_LAYERS}-pw{POS_WEIGHT}"
+        f"-swp{SENTIMENT_WEIGHT_POWER}"
+    )
+) as run:
     mlflow.log_params({
         "epochs": EPOCHS,
         "micro_batch": MICRO_BATCH,
@@ -712,6 +960,7 @@ with mlflow.start_run(run_name=f"laya-{EPOCHS}ep-top{TOP_LAYERS}-pw{POS_WEIGHT}"
         "learning_rate": LR,
         "top_layers": TOP_LAYERS,
         "pos_weight": POS_WEIGHT,
+        "sentiment_weight_power": SENTIMENT_WEIGHT_POWER,
         "num_gpus": NUM_GPUS,
         "sequences_table": SEQUENCES_TABLE,
         "train_sequences": len(train_pd),
@@ -735,6 +984,7 @@ with mlflow.start_run(run_name=f"laya-{EPOCHS}ep-top{TOP_LAYERS}-pw{POS_WEIGHT}"
         "LAYA_LR": str(LR),
         "LAYA_TOP_LAYERS": str(TOP_LAYERS),
         "LAYA_POS_WEIGHT": str(POS_WEIGHT),
+        "LAYA_SENTIMENT_WEIGHT_POWER": str(SENTIMENT_WEIGHT_POWER),
         "LAYA_MLFLOW_RUN_ID": run.info.run_id,
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "PYTHONPATH": (
@@ -753,27 +1003,55 @@ with mlflow.start_run(run_name=f"laya-{EPOCHS}ep-top{TOP_LAYERS}-pw{POS_WEIGHT}"
     import sys
     if TRAIN_FN_DIR not in sys.path:
         sys.path.insert(0, TRAIN_FN_DIR)
-    import laya_train_fn
     import importlib
+
+    import laya_train_fn
+
     importlib.reload(laya_train_fn)
 
     if NUM_GPUS > 1:
+        from py4j.protocol import Py4JError
         from pyspark.ml.torch.distributor import TorchDistributor
-        summary = TorchDistributor(
-            num_processes=NUM_GPUS, local_mode=True, use_gpu=True
-        ).run(laya_train_fn.train)
+
+        try:
+            TorchDistributor(
+                num_processes=NUM_GPUS, local_mode=True, use_gpu=True
+            ).run(laya_train_fn.train)
+        except Py4JError as error:
+            if not os.path.isfile(SUMMARY_PATH):
+                raise
+            print(
+                "TorchDistributor lost its Spark callback after the chief "
+                f"persisted the completed checkpoint; continuing: {error}"
+            )
     else:
-        summary = laya_train_fn.train()
+        laya_train_fn.train()
+
+    if not os.path.isfile(SUMMARY_PATH):
+        raise RuntimeError(
+            "Training completed without a durable summary at "
+            f"{SUMMARY_PATH}"
+        )
+    with open(SUMMARY_PATH, encoding="utf-8") as summary_file:
+        summary = json.load(summary_file)
 
     print(json.dumps(summary, indent=2))
     mlflow.log_dict(summary, "training_summary.json")
+    mlflow.log_artifacts(OUTPUT_DIR, artifact_path="checkpoint")
+    mlflow.log_dict(
+        {"pip_requirements": SERVING_REQUIREMENTS},
+        "serving_requirements.json",
+    )
     mlflow.pyfunc.log_model(
         artifact_path="laya_model",
         python_model=LayaDecisionModel(),
         artifacts={"checkpoint": OUTPUT_DIR},
         signature=SERVING_SIGNATURE,
         input_example=SERVING_EXAMPLE,
-        pip_requirements=["laya", "torch", "transformers", "safetensors"],
+        pip_requirements=SERVING_REQUIREMENTS,
+        # The wrapper reads its budgets from the canonical prompt module, so the
+        # serving container needs the file.
+        code_paths=[PACKAGED_LAYA_QUESTIONS_PATH],
     )
 
     FINAL_RUN_ID = run.info.run_id
@@ -793,6 +1071,17 @@ print(f"MLflow run: {FINAL_RUN_ID}")
 MIN_ACCURACY = 83.0
 REGISTERED_VERSION = None
 
+missing_summary_kinds = [
+    kind
+    for kind in EXPECTED_DECISION_KINDS
+    if summary["counts"].get(kind, 0) <= 0 or kind not in summary["by_kind"]
+]
+if missing_summary_kinds:
+    raise RuntimeError(
+        "Registration refused because evaluation is incomplete for: "
+        + ", ".join(missing_summary_kinds)
+    )
+
 if summary["post_train_accuracy_pct"] >= MIN_ACCURACY:
     result = mlflow.register_model(
         model_uri=f"runs:/{FINAL_RUN_ID}/laya_model",
@@ -800,7 +1089,10 @@ if summary["post_train_accuracy_pct"] >= MIN_ACCURACY:
     )
     REGISTERED_VERSION = result.version
     print(f"Registered {REGISTERED_MODEL} version {result.version}")
-    print(f"Accuracy {summary['post_train_accuracy_pct']}% | {summary['by_kind']}")
+    print(
+        f"Accuracy {summary['post_train_accuracy_pct']}% | "
+        f"counts={summary['counts']} | accuracy={summary['by_kind']}"
+    )
 else:
     print(
         f"Not registered. Accuracy {summary['post_train_accuracy_pct']}% "
@@ -848,15 +1140,48 @@ elif SERVING_ENDPOINT:
         w.serving_endpoints.update_config(
             name=SERVING_ENDPOINT, served_entities=[entity]
         )
-        print(f"Updated endpoint {SERVING_ENDPOINT} to version {REGISTERED_VERSION}")
+        print(f"Updating endpoint {SERVING_ENDPOINT} to version {REGISTERED_VERSION}")
     else:
         w.serving_endpoints.create(
             name=SERVING_ENDPOINT,
             config=EndpointCoreConfigInput(served_entities=[entity]),
         )
-        print(f"Created endpoint {SERVING_ENDPOINT} at version {REGISTERED_VERSION}")
+        print(f"Creating endpoint {SERVING_ENDPOINT} at version {REGISTERED_VERSION}")
 
+    deadline = time.monotonic() + 45 * 60
+    while True:
+        endpoint = w.serving_endpoints.get(SERVING_ENDPOINT)
+        ready = getattr(endpoint.state.ready, "value", str(endpoint.state.ready))
+        config_update = getattr(
+            endpoint.state.config_update,
+            "value",
+            str(endpoint.state.config_update),
+        )
+        print(f"Endpoint state: ready={ready}, config_update={config_update}")
+        if config_update == "NOT_UPDATING":
+            if ready != "READY":
+                raise RuntimeError(
+                    f"Endpoint {SERVING_ENDPOINT} stopped updating but is {ready}"
+                )
+            break
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Endpoint {SERVING_ENDPOINT} did not become ready within 45 minutes"
+            )
+        time.sleep(15)
+
+    deployed_versions = {
+        str(served.entity_version)
+        for served in (endpoint.config.served_entities or [])
+    }
+    if deployed_versions != {str(REGISTERED_VERSION)}:
+        raise RuntimeError(
+            f"Endpoint {SERVING_ENDPOINT} has unexpected deployed versions: "
+            f"{sorted(deployed_versions)}"
+        )
+    print(f"Endpoint {SERVING_ENDPOINT} is ready on version {REGISTERED_VERSION}")
     summary["serving_endpoint"] = SERVING_ENDPOINT
+    summary["endpoint_ready"] = True
 else:
     print("serving_endpoint widget is blank; skipping publish.")
 

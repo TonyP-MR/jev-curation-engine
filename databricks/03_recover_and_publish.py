@@ -2,39 +2,157 @@
 # MAGIC %md
 # MAGIC # Recover and publish a trained Laya checkpoint
 # MAGIC
-# MAGIC Training run `bb46c09dfc0a42308e27b003143ee8c1` reached 89.33% and saved its
-# MAGIC checkpoint, then the driver REPL died during `mlflow.pyfunc.log_model` with
-# MAGIC `Py4JException: Error while obtaining a new communication channel`. The weights
-# MAGIC are still on the cluster's local disk, so this republishes them instead of
-# MAGIC spending another GPU hour retraining.
-# MAGIC
-# MAGIC The wrapper class below is generated from `databricks/02_laya_gpu_training.py`
-# MAGIC so the two cannot drift.
+# MAGIC Use this only when a qualifying training run saved its best-epoch checkpoint
+# MAGIC but failed while packaging or registering it. The source run must contain the
+# MAGIC complete four-kind metrics written by `02_laya_gpu_training`; this notebook
+# MAGIC refuses incomplete or below-threshold runs rather than bypassing the training
+# MAGIC registration gate.
 
 # COMMAND ----------
 
-# MAGIC %pip install laya>=0.3.4 transformers>=5.17.0 safetensors --quiet
+# MAGIC %pip install laya>=0.3.4 transformers==4.57.6 safetensors --quiet
 # MAGIC %restart_python
 
 # COMMAND ----------
 
 import json
 import os
+import shutil
+import sys
+import time
+from importlib.metadata import version as package_version
 
 import mlflow
+import pandas as pd
+from mlflow.exceptions import MlflowException
 from mlflow.models import ModelSignature
+from mlflow.tracking import MlflowClient
 from mlflow.types import ColSpec, Schema
 
+_NOTEBOOK_DIR = os.path.dirname(
+    dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()
+)
+for _candidate in (f"/Workspace{_NOTEBOOK_DIR}", _NOTEBOOK_DIR):
+    if _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
+
+import laya_questions
+
+LAYA_QUESTIONS_PATH = laya_questions.__file__
+PACKAGED_LAYA_QUESTIONS_PATH = "/local_disk0/laya_questions.py"
+shutil.copyfile(LAYA_QUESTIONS_PATH, PACKAGED_LAYA_QUESTIONS_PATH)
+SERVING_REQUIREMENTS = [
+    f"{package}=={package_version(package)}"
+    for package in (
+        "cloudpickle",
+        "laya",
+        "torch",
+        "transformers",
+        "safetensors",
+    )
+]
+print(f"Exact serving requirements: {SERVING_REQUIREMENTS}")
+
+dbutils.widgets.text("source_run_id", "", "Qualifying training run ID")
+dbutils.widgets.text("serving_endpoint", "laya-curation-engine", "Serving endpoint")
+
 CHECKPOINT = "/local_disk0/laya_checkpoint"
-SOURCE_RUN_ID = "bb46c09dfc0a42308e27b003143ee8c1"
+SOURCE_RUN_ID = dbutils.widgets.get("source_run_id").strip()
 REGISTERED_MODEL = "muckrack_data.laya.laya_typed_decisions"
-SERVING_ENDPOINT = "laya-curation-engine"
+SERVING_ENDPOINT = dbutils.widgets.get("serving_endpoint").strip()
+EXPECTED_DECISION_KINDS = ("validation", "prominence", "sentiment", "tag")
+MIN_ACCURACY = 83.0
+
+if not SOURCE_RUN_ID:
+    raise RuntimeError("source_run_id is required")
+if not SERVING_ENDPOINT:
+    raise RuntimeError("serving_endpoint is required")
+
+mlflow.set_registry_uri("databricks-uc")
+client = MlflowClient()
+source_run = client.get_run(SOURCE_RUN_ID)
+source_metrics = source_run.data.metrics
+required_metrics = {
+    "post_train_accuracy_pct",
+    "best_epoch",
+    "best_val_loss",
+}
+for kind in EXPECTED_DECISION_KINDS:
+    required_metrics.add(f"post_train_{kind}_count")
+    required_metrics.add(f"post_train_{kind}_accuracy_pct")
+
+missing_metrics = sorted(required_metrics - source_metrics.keys())
+zero_count_kinds = [
+    kind
+    for kind in EXPECTED_DECISION_KINDS
+    if source_metrics.get(f"post_train_{kind}_count", 0) <= 0
+]
+if missing_metrics or zero_count_kinds:
+    details = []
+    if missing_metrics:
+        details.append("missing metrics: " + ", ".join(missing_metrics))
+    if zero_count_kinds:
+        details.append("zero-count kinds: " + ", ".join(zero_count_kinds))
+    raise RuntimeError(
+        f"Source run {SOURCE_RUN_ID} has incomplete evaluation; " + "; ".join(details)
+    )
+source_accuracy = source_metrics["post_train_accuracy_pct"]
+if source_accuracy < MIN_ACCURACY:
+    raise RuntimeError(
+        f"Source run {SOURCE_RUN_ID} accuracy {source_accuracy}% is below "
+        f"the {MIN_ACCURACY}% registration gate"
+    )
+
+
+def _find_checkpoint(root: str) -> str | None:
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if "rl_agent_config.json" in filenames:
+            return dirpath
+    return None
+
+
+def _checkpoint_run_id(root: str) -> str | None:
+    marker = os.path.join(root, "training_run_id.txt")
+    if not os.path.isfile(marker):
+        return None
+    with open(marker, encoding="utf-8") as marker_file:
+        return marker_file.read().strip()
+
+
+if _checkpoint_run_id(CHECKPOINT) != SOURCE_RUN_ID:
+    print(
+        "Local checkpoint is absent or belongs to another run; "
+        f"downloading artifacts from {SOURCE_RUN_ID}"
+    )
+    recovered_checkpoint = None
+    download_errors = []
+    for artifact_path in ("checkpoint", "laya_model"):
+        try:
+            local_artifact = mlflow.artifacts.download_artifacts(
+                f"runs:/{SOURCE_RUN_ID}/{artifact_path}"
+            )
+        except MlflowException as error:
+            download_errors.append(f"{artifact_path}: {error}")
+            continue
+        recovered_checkpoint = _find_checkpoint(local_artifact)
+        if recovered_checkpoint:
+            break
+
+    if not recovered_checkpoint:
+        raise RuntimeError(
+            "No checkpoint found in source-run artifacts. "
+            + " | ".join(download_errors)
+        )
+    CHECKPOINT = recovered_checkpoint
 
 present = sorted(os.listdir(CHECKPOINT)) if os.path.isdir(CHECKPOINT) else []
 print(f"checkpoint dir: {CHECKPOINT}")
 print(f"contents: {present}")
-if not present:
-    dbutils.notebook.exit(json.dumps({"error": "checkpoint missing", "dir": CHECKPOINT}))
+checkpoint_run_id = _checkpoint_run_id(CHECKPOINT)
+if checkpoint_run_id != SOURCE_RUN_ID:
+    raise RuntimeError(
+        f"Checkpoint belongs to run {checkpoint_run_id!r}, not {SOURCE_RUN_ID}"
+    )
 
 # COMMAND ----------
 
@@ -54,18 +172,21 @@ FALSE_TAG = {"type": "noul", "noul": 0.0, "confidence": 1.0}
 
 # Matches VALIDATION_THRESHOLD in backend/config.py. Gating on a different
 # number here would make served and local answers disagree.
-VALIDATION_GATE = 0.50
+VALIDATION_GATE = 0.45
 
 
 class LayaDecisionModel(mlflow.pyfunc.PythonModel):
     def load_context(self, context):
         import laya
         import torch
+        from laya_questions import HEAD_MAX_LEN, MAX_LEN
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.agent = laya.load(context.artifacts["checkpoint"], device=device)
-        self.agent.cfg["max_len"] = 2048
-        self.agent.cfg["head_max_len"] = 384
+        # Serve at the budget the sequences were built and trained at. This was
+        # 2048/384, a truncation regime the fine-tune never saw.
+        self.agent.cfg["max_len"] = MAX_LEN
+        self.agent.cfg["head_max_len"] = HEAD_MAX_LEN
 
     def _decide(self, state, questions):
         val_questions = {k: v for k, v in questions.items() if k.endswith("_valid")}
@@ -132,6 +253,58 @@ SERVING_SIGNATURE = ModelSignature(
     inputs=Schema([ColSpec("string", "state"), ColSpec("string", "questions")]),
     outputs=Schema([ColSpec("string")]),
 )
+SERVING_EXAMPLE = pd.DataFrame(
+    [{
+        "state": "Headline: Example Corp names a new CFO\n\n\nLead Paragraph:\nExample Corp announced...",
+        "questions": json.dumps({
+            "subj_1_valid": {
+                "type": "noul",
+                "instructions": "Is the provided content meaningfully relevant to 'Example Corp'?",
+                "criteria": {"true": "Relevant to Example Corp.", "false": "Not relevant."},
+            }
+        }),
+    }]
+)
+
+# COMMAND ----------
+
+# Re-log only a checkpoint whose run has already cleared the complete evaluation
+# and aggregate accuracy gates above.
+with mlflow.start_run(run_name=f"recover-{SOURCE_RUN_ID}") as run:
+    mlflow.log_params(
+        {
+            "source_run_id": SOURCE_RUN_ID,
+            "source_accuracy_pct": source_accuracy,
+            "source_best_epoch": source_metrics["best_epoch"],
+        }
+    )
+    mlflow.log_dict(
+        {"pip_requirements": SERVING_REQUIREMENTS},
+        "serving_requirements.json",
+    )
+    mlflow.pyfunc.log_model(
+        artifact_path="laya_model",
+        python_model=LayaDecisionModel(),
+        artifacts={"checkpoint": CHECKPOINT},
+        signature=SERVING_SIGNATURE,
+        input_example=SERVING_EXAMPLE,
+        pip_requirements=SERVING_REQUIREMENTS,
+        code_paths=[PACKAGED_LAYA_QUESTIONS_PATH],
+    )
+    LOG_RUN_ID = run.info.run_id
+
+versions_before = client.search_model_versions(f"name='{REGISTERED_MODEL}'")
+if "2" not in {str(version.version) for version in versions_before}:
+    raise RuntimeError(
+        f"Rollback version 2 is missing from {REGISTERED_MODEL}; refusing publication"
+    )
+
+registered = mlflow.register_model(
+    model_uri=f"runs:/{LOG_RUN_ID}/laya_model",
+    name=REGISTERED_MODEL,
+)
+NEW_VERSION = registered.version
+print(f"registered {REGISTERED_MODEL} v{NEW_VERSION} from run {LOG_RUN_ID}")
 
 # COMMAND ----------
 
@@ -145,7 +318,7 @@ from databricks.sdk.service.serving import (
 w = WorkspaceClient()
 entity = ServedEntityInput(
     entity_name=REGISTERED_MODEL,
-    entity_version="1",
+    entity_version=str(NEW_VERSION),
     workload_size="Small",
     workload_type=ServingModelWorkloadType.GPU_SMALL,
     scale_to_zero_enabled=True,
@@ -161,8 +334,53 @@ else:
     )
     action = "created"
 
+deadline = time.monotonic() + 45 * 60
+while True:
+    endpoint = w.serving_endpoints.get(SERVING_ENDPOINT)
+    ready = getattr(endpoint.state.ready, "value", str(endpoint.state.ready))
+    config_update = getattr(
+        endpoint.state.config_update,
+        "value",
+        str(endpoint.state.config_update),
+    )
+    print(f"Endpoint state: ready={ready}, config_update={config_update}")
+    if config_update == "NOT_UPDATING":
+        if ready != "READY":
+            raise RuntimeError(
+                f"Endpoint {SERVING_ENDPOINT} stopped updating but is {ready}"
+            )
+        break
+    if time.monotonic() >= deadline:
+        raise TimeoutError(
+            f"Endpoint {SERVING_ENDPOINT} did not become ready within 45 minutes"
+        )
+    time.sleep(15)
+
+deployed_versions = {
+    str(served.entity_version)
+    for served in (endpoint.config.served_entities or [])
+}
+if deployed_versions != {str(NEW_VERSION)}:
+    raise RuntimeError(
+        f"Endpoint {SERVING_ENDPOINT} has unexpected deployed versions: "
+        f"{sorted(deployed_versions)}"
+    )
+
+versions_after = client.search_model_versions(f"name='{REGISTERED_MODEL}'")
+if "2" not in {str(version.version) for version in versions_after}:
+    raise RuntimeError(
+        f"Rollback version 2 disappeared from {REGISTERED_MODEL}"
+    )
+
 dbutils.notebook.exit(json.dumps({
-    "version": "1",
+    "source_run_id": SOURCE_RUN_ID,
+    "packaging_run_id": LOG_RUN_ID,
+    "source_accuracy_pct": source_accuracy,
+    "source_best_epoch": source_metrics["best_epoch"],
+    "version": str(NEW_VERSION),
+    "rollback_version": "2",
     "endpoint": SERVING_ENDPOINT,
+    "endpoint_ready": True,
     "action": action,
+    "pip_requirements": SERVING_REQUIREMENTS,
 }))

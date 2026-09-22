@@ -113,6 +113,10 @@ class Settings(BaseSettings):
     BENCHMARK_CONCURRENCY: int = 5
     LAYA_BENCHMARK_CONCURRENCY: int = 8
     VALIDATION_THRESHOLD: float = 0.45
+    # Applied when no match term for the subject appears in the article text. The
+    # presence check is a heuristic over a curator-authored label with no alias list
+    # behind it, so absence raises the bar for the model instead of overruling it.
+    ABSENT_ENTITY_VALIDATION_THRESHOLD: float = 0.65
     TAG_THRESHOLD: float = 0.40
     # --- Baseline LLM pricing (used when the blob has no recorded cost) ---
     # Audit blobs write llm_cost_usd = null, so the rig estimates from llm_tokens.

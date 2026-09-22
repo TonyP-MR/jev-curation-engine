@@ -6,6 +6,8 @@ from typing import Any
 
 import laya
 import torch
+from config import settings
+from laya_questions import HEAD_MAX_LEN, MAX_LEN
 
 logger = logging.getLogger(__name__)
 
@@ -115,9 +117,10 @@ class LayaRunner:
         )
         t_load = (time.perf_counter() - t0) * 1000.0
         logger.info(f"Loaded Laya model '{target['display_name']}' in {t_load:.1f} ms")
-        # Expand context budget: 2048 sequence tokens, 384 head tokens
-        agent.cfg["max_len"] = 2048
-        agent.cfg["head_max_len"] = 384
+        # Run at the budget the checkpoint was fine-tuned on. A wider window puts the
+        # model in a truncation regime it never saw during training.
+        agent.cfg["max_len"] = MAX_LEN
+        agent.cfg["head_max_len"] = HEAD_MAX_LEN
         self._agents[cache_key] = agent
         return agent
 
@@ -152,35 +155,6 @@ class LayaRunner:
             }
         return sanitized
 
-    def _calibrate_priors(self, answers: dict[str, Any]) -> dict[str, Any]:
-        """Applies empirical base-rate prior adjustments for editorial news reporting."""
-        for qid, ans in answers.items():
-            if qid.endswith("_prominence") and ans.get("type") == "choice":
-                probs = dict(ans.get("probabilities", {}))
-                if probs and "passing" in probs:
-                    probs["passing"] = probs.get("passing", 0.0) * 1.5
-                    probs["significant"] = probs.get("significant", 0.0) * 0.8
-                    probs["primary"] = probs.get("primary", 0.0) * 0.7
-                    s = sum(probs.values())
-                    if s > 0:
-                        probs = {k: round(v / s, 4) for k, v in probs.items()}
-                    ans["probabilities"] = probs
-                    ans["choice"] = max(probs, key=probs.get)
-
-            elif qid.endswith("_sentiment") and ans.get("type") == "choice":
-                probs = dict(ans.get("probabilities", {}))
-                if probs and "neutral" in probs:
-                    probs["neutral"] = probs.get("neutral", 0.0) * 1.6
-                    probs["positive"] = probs.get("positive", 0.0) * 0.7
-                    probs["negative"] = probs.get("negative", 0.0) * 0.8
-                    probs["balanced"] = probs.get("balanced", 0.0) * 0.6
-                    s = sum(probs.values())
-                    if s > 0:
-                        probs = {k: round(v / s, 4) for k, v in probs.items()}
-                    ans["probabilities"] = probs
-                    ans["choice"] = max(probs, key=probs.get)
-        return answers
-
     def _predict_sync(
         self,
         agent: Any,
@@ -200,7 +174,7 @@ class LayaRunner:
             valid_subjects = set()
             for qid, ans in answers.items():
                 s_id = qid.replace("subj_", "").replace("_valid", "")
-                if ans.get("noul", 0.0) >= 0.50:
+                if ans.get("noul", 0.0) >= settings.VALIDATION_THRESHOLD:
                     valid_subjects.add(s_id)
 
             stage2_questions: dict[str, dict[str, Any]] = {}
@@ -244,17 +218,14 @@ class LayaRunner:
                 answers.update(res_stage2.get("answers", {}))
                 input_tokens += int(res_stage2.get("usage", {}).get("input_tokens", 0))
 
-            calibrated_answers = self._calibrate_priors(answers)
             return {
                 "model": agent.cfg.get("model_name", "laya-rl-agent"),
-                "answers": calibrated_answers,
+                "answers": answers,
                 "usage": {"input_tokens": input_tokens, "output_tokens": 0},
             }
 
         # Otherwise evaluate all questions in one forward pass
-        raw_result = agent.predict(state, questions)
-        raw_result["answers"] = self._calibrate_priors(raw_result.get("answers", {}))
-        return raw_result
+        return agent.predict(state, questions)
 
     async def evaluate_article(
         self,
