@@ -127,6 +127,12 @@ def list_providers():
                 ],
             },
             {
+                "id": "typesafe",
+                "name": "TypeSafe Jev (Direct Cloud API)",
+                "configured": bool(settings.TYPESAFE_API_KEY),
+                "models": [{"id": "jev-latest", "name": "jev-latest"}],
+            },
+            {
                 "id": "openrouter",
                 "name": "OpenRouter Jev (Proxy Cloud API)",
                 "models": [{"id": "typesafe/jev-1.13", "name": "typesafe/jev-1.13"}],

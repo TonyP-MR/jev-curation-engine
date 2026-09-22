@@ -126,17 +126,18 @@ it is the better option for iterating on thresholds against a fresh model.
 
 ### How a selection is routed
 
-The model string is the source of truth. `TypeSafeRunner._resolve_engine` maps
-it to an engine, and the `provider` field only disambiguates the Laya variants.
-Order matters: `laya:databricks:local` is checked before `laya:databricks`
-because one is a prefix of the other.
+The model string identifies the engine and model. The app also sends an explicit
+`provider` so direct TypeSafe and OpenRouter Jev requests use separate credentials
+and endpoints. Order matters: `laya:databricks:local` is checked before
+`laya:databricks` because one is a prefix of the other.
 
-| Dropdown value | Engine | Where it runs |
+| Dropdown value | Provider / engine | Where it runs |
 |---|---|---|
 | `laya:azure:t4` | `laya_azure` | `dev-002` in uksouth |
 | `laya:databricks` | `laya_databricks` | Databricks Model Serving |
 | `laya:databricks:local` | `laya_local` | `runs/laya_databricks` on local MPS |
-| `jev-latest`, `typesafe/jev-1.13` | `jev` | TypeSafe or OpenRouter |
+| `jev-latest` | `typesafe` | TypeSafe direct cloud API |
+| `typesafe/jev-1.13` | `openrouter` | OpenRouter proxy cloud API |
 
 ## Keeping the prompts in sync
 

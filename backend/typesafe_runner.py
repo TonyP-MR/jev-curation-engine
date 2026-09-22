@@ -16,20 +16,15 @@ logger = logging.getLogger(__name__)
 LAYA_AZURE = "laya_azure"
 LAYA_DATABRICKS = "laya_databricks"
 LAYA_LOCAL = "laya_local"
+TYPESAFE = "typesafe"
+OPENROUTER = "openrouter"
 
 
 class TypeSafeRunner:
     def __init__(self):
         self.provider = settings.JEV_PROVIDER.lower()
-        self.api_key = settings.TYPESAFE_API_KEY
-        self.api_base = settings.TYPESAFE_API_BASE
-        self.model = settings.TYPESAFE_MODEL
         self.cost_per_m_input = settings.TYPESAFE_COST_PER_MILLION_INPUT_TOKENS
         self._client: Optional[httpx.AsyncClient] = None
-        if self.provider == "openrouter":
-            self.api_key = settings.OPENROUTER_JEV_API_KEY or settings.OPENROUTER_API_KEY
-            self.api_base = settings.OPENROUTER_BASE_URL
-            self.model = settings.OPENROUTER_JEV_MODEL
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -51,18 +46,19 @@ class TypeSafeRunner:
         caller omits the model.
         """
         hint = (provider or self.provider).lower()
-        target = model or (settings.LAYA_MODEL if hint.startswith("laya") else self.model)
-        name = str(target or "").lower()
+        name = str(model or "").lower()
 
         # Checked first: the downloaded-weights variant is a prefix of the
         # served variant, so ordering decides which branch wins.
         if hint == LAYA_LOCAL or name.startswith(("local:", "laya:local", "laya:databricks:local")):
-            return LAYA_LOCAL, target
+            return LAYA_LOCAL, model or settings.LAYA_MODEL
         if hint == LAYA_DATABRICKS or name.startswith("laya:databricks"):
-            return LAYA_DATABRICKS, target
+            return LAYA_DATABRICKS, model or settings.LAYA_MODEL
         if hint in (LAYA_AZURE, "laya") or name.startswith("laya:azure"):
-            return LAYA_AZURE, target
-        return "jev", target
+            return LAYA_AZURE, model or settings.LAYA_MODEL
+        if hint == OPENROUTER or name.startswith("typesafe/"):
+            return OPENROUTER, model or settings.OPENROUTER_JEV_MODEL
+        return TYPESAFE, model or settings.TYPESAFE_MODEL
 
     def _laya_transport(self, engine: str) -> dict[str, Any]:
         """Endpoint, auth and wire model name for a remote System 1 engine."""
@@ -131,7 +127,7 @@ class TypeSafeRunner:
         if engine in (LAYA_AZURE, LAYA_DATABRICKS):
             return await self._evaluate_laya_remote(engine, state, questions)
 
-        return await self._evaluate_jev(state, questions, target_model)
+        return await self._evaluate_jev(engine, state, questions, target_model)
 
     # Transient DNS and connection failures cost a whole article otherwise: one
     # resolver hiccup under concurrent load and the run records it as failed.
@@ -224,17 +220,19 @@ class TypeSafeRunner:
 
     async def _evaluate_jev(
         self,
+        provider: str,
         state: str,
         questions: Dict[str, Dict[str, Any]],
         target_model: str,
     ) -> Dict[str, Any]:
-        if self.provider == "openrouter":
-            root = self.api_base.rstrip("/")
+        if provider == OPENROUTER:
+            api_key = settings.OPENROUTER_JEV_API_KEY or settings.OPENROUTER_API_KEY
+            root = settings.OPENROUTER_BASE_URL.rstrip("/")
             if root.endswith("/api/v1"):
                 root = root[: -len("/api/v1")]
             endpoint = f"{root}/api/alpha/decisions"
             headers = {
-                "Authorization": f"Bearer {self.api_key}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "HTTP-Referer": settings.OPENROUTER_HTTP_REFERER or "https://muckrack.com/curation-engine",
                 "X-Title": settings.OPENROUTER_APP_TITLE,
@@ -242,16 +240,16 @@ class TypeSafeRunner:
                 "User-Agent": settings.OPENROUTER_USER_AGENT or settings.OPENROUTER_APP_TITLE,
             }
         else:
-            # The direct TypeSafe provider has never worked: the original code
-            # assigned `endpoint` only on the OpenRouter branch, so this path
-            # raised NameError. Every plausible URL under TYPESAFE_API_BASE
-            # returns 404, so there is nothing to point it at. Fail with a
-            # message that says so rather than posting into the void.
-            raise RuntimeError(
-                f"JEV_PROVIDER={self.provider!r} has no working endpoint. "
-                "Set JEV_PROVIDER=openrouter, or supply the real direct-API "
-                "path before using this provider."
-            )
+            api_key = settings.TYPESAFE_API_KEY
+            root = settings.TYPESAFE_API_BASE.rstrip("/")
+            endpoint = root if root.endswith("/systemone") else f"{root}/systemone"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+
+        if not api_key:
+            raise RuntimeError(f"{provider} Jev selected but its API key is unset.")
 
         payload = {
             "state": state,
@@ -269,7 +267,7 @@ class TypeSafeRunner:
                     current_state = payload.get("state", "")
                     new_len = len(current_state) // 2
                     logger.warning(
-                        f"Jev {self.provider} max_tokens_exceeded on attempt {attempt + 1}. "
+                        f"Jev {provider} max_tokens_exceeded on attempt {attempt + 1}. "
                         f"Throttling state from {len(current_state)} to {new_len} chars and retrying..."
                     )
                     payload["state"] = current_state[:new_len] + "\n\n[... truncated due to max_tokens_exceeded ...]"
@@ -278,26 +276,26 @@ class TypeSafeRunner:
                 if resp.status_code in (500, 502, 503, 504, 520, 521, 522, 524, 429) and attempt < max_retries:
                     wait_sec = (attempt + 1) * 2.0
                     logger.warning(
-                        f"Jev {self.provider} API {resp.status_code} on attempt {attempt + 1}, retrying in {wait_sec}s..."
+                        f"Jev {provider} API {resp.status_code} on attempt {attempt + 1}, retrying in {wait_sec}s..."
                     )
                     await asyncio.sleep(wait_sec)
                     continue
                 if resp.is_error:
-                    raise RuntimeError(f"Jev {self.provider} API {resp.status_code}: {resp.text[:1000]}")
+                    raise RuntimeError(f"Jev {provider} API {resp.status_code}: {resp.text[:1000]}")
                 data = resp.json()
                 break
             except (httpx.TimeoutException, httpx.NetworkError) as net_err:
                 if attempt < max_retries:
                     wait_sec = (attempt + 1) * 2.0
                     logger.warning(
-                        f"Jev {self.provider} network error on attempt {attempt + 1}: {net_err}, retrying in {wait_sec}s..."
+                        f"Jev {provider} network error on attempt {attempt + 1}: {net_err}, retrying in {wait_sec}s..."
                     )
                     await asyncio.sleep(wait_sec)
                     continue
                 raise
 
         if data is None:
-            raise RuntimeError(f"Jev {self.provider} API exhausted {max_retries} retries without a response.")
+            raise RuntimeError(f"Jev {provider} API exhausted {max_retries} retries without a response.")
 
         duration_ms = (time.perf_counter() - start_time) * 1000.0
         usage = data.get("usage", {})
@@ -308,7 +306,7 @@ class TypeSafeRunner:
         cost_usd = (input_tokens / 1_000_000.0) * self.cost_per_m_input
 
         return {
-            "provider": self.provider,
+            "provider": provider,
             "model": data.get("model", target_model),
             "answers": data.get("answers", {}),
             "usage": {

@@ -407,7 +407,8 @@ const pctLabel = v => (v === null || v === undefined ? 'n/a' : `${v}%`);
     if (model.startsWith('laya:databricks:local')) return 'laya_local';
     if (model.startsWith('laya:databricks')) return 'laya_databricks';
     if (model.startsWith('laya')) return 'laya_azure';
-    return undefined;
+    if (model.startsWith('typesafe/')) return 'openrouter';
+    return 'typesafe';
   };
 
   const runBenchmark = async () => {
@@ -753,6 +754,7 @@ const pctLabel = v => (v === null || v === undefined ? 'n/a' : `${v}%`);
                     <option value="laya:databricks:local">Laya: Databricks Weights (local MPS)</option>
                   </optgroup>
                   <optgroup label="Cloud API">
+                    <option value="jev-latest">TypeSafe Jev (Direct Cloud)</option>
                     <option value="typesafe/jev-1.13">TypeSafe Jev (OpenRouter Cloud)</option>
                   </optgroup>
                 </select>

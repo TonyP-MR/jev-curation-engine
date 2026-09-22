@@ -24,14 +24,15 @@ The platform supports these evaluation tiers:
 3. **Laya (Self-Hosted on Azure GPU)**: Dedicated open-weight bidirectional encoder backbone (**ModernBERT-large**, 421M parameters) fine-tuned on Curation Engine production audit data and deployed on dedicated Azure hardware.
 4. **Laya (Databricks)**: The same architecture trained on the `muckrack-data` Databricks workspace and served two ways, either from a Model Serving GPU endpoint or from weights pulled out of Unity Catalog and run locally on Apple MPS. See [Laya on Databricks](#laya-on-databricks) below.
 
-The model string in the **Decision Engine** dropdown is the source of truth for routing. `TypeSafeRunner._resolve_engine` maps it to an engine, and the `provider` field only disambiguates the Laya variants.
+The model string in the **Decision Engine** dropdown identifies the engine and model. The app also sends an explicit `provider` so direct TypeSafe and OpenRouter Jev requests use separate credentials and endpoints; `JEV_PROVIDER` remains the fallback for callers that omit it.
 
-| Dropdown value | Engine | Where it runs |
+| Dropdown value | Provider / engine | Where it runs |
 | :--- | :--- | :--- |
 | `laya:azure:t4` | `laya_azure` | `dev-002` in uksouth |
 | `laya:databricks` | `laya_databricks` | Databricks Model Serving |
 | `laya:databricks:local` | `laya_local` | `runs/laya_databricks` on local MPS |
-| `jev-latest`, `typesafe/jev-1.13` | `jev` | TypeSafe or OpenRouter |
+| `jev-latest` | `typesafe` | TypeSafe direct cloud API |
+| `typesafe/jev-1.13` | `openrouter` | OpenRouter proxy cloud API |
 
 ## Repository layout
 
@@ -108,7 +109,7 @@ flowchart TD
         ENGINE -->|"laya:azure:t4"| LAYA
         ENGINE -->|"laya:databricks"| DBX
         ENGINE -->|"laya:databricks:local"| DBXL
-        ENGINE -->|"jev-latest"| JEV
+        ENGINE -->|"jev-latest / typesafe/jev-1.13"| JEV
     end
 
     API --> ENGINE
